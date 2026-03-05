@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         MULTI-SYMBOL FUTURES SCANNER + TRADING BOT  —  v3.6               ║
+║         MULTI-SYMBOL FUTURES SCANNER + TRADING BOT  —  v3.7               ║
 ║                                                                              ║
-║  New in v3.6 (full audit + consistency pass):                               ║
+║  New in v3.7 (full audit + consistency pass):                               ║
 ║  [A]  5 new indicators added to scoring engine                              ║
 ║         StochRSI (K/D), MACD histogram, EMA21, OBV, Candle direction       ║
 ║  [B]  Scoring rebuilt: 7 factors + candle multiplier, weights rebalanced    ║
@@ -51,7 +51,7 @@ CONFIG = {
 
     # ── Watchlist ─────────────────────────────────────────────────────────────
     'SEMBOL_LISTESI': [
-        'HYPE/USDT',
+        'RENDER/USDT',
         'SOL/USDT',
         'ETH/USDT',
         'BNB/USDT',
@@ -108,7 +108,7 @@ CONFIG = {
     # ATR_SL_CARPAN   : stop loss distance in ATR multiples.
     #                   1.5 = tight (faster SL, less room for noise)
     #                   2.0 = loose (more room, larger loss if SL hit)
-    'RISK_ORANI':       0.02,
+    'RISK_ORANI':       0.05,
     'GUNLUK_MAX_ZARAR': 0.05,
     'ATR_SL_CARPAN':    1.5,
     'BREAKEVEN_TETIK':  0.008,
@@ -168,6 +168,30 @@ CONFIG = {
     # exists on the exchange. Catches manual closes, liquidations, etc.
     # 4 ticks × 15s = every 60 seconds. Lower = more API calls.
     'POZ_SYNC_ARALIK':   4,
+
+    # ── Exchange-Side Bracket Orders ──────────────────────────────────────────
+    # BRACKET_EMIR     : True  = place STOP_MARKET + TAKE_PROFIT_MARKET on
+    #                            Binance the instant a trade opens. Position is
+    #                            protected even if this bot crashes or loses
+    #                            internet. STRONGLY RECOMMENDED for live trading.
+    #                    False = software-only SL/TP (original behaviour).
+    # SL_UPDATE_ESIK   : only update the exchange-side STOP_MARKET when the
+    #                    trailing stop improves by at least this fraction.
+    #                    0.0015 = 0.15% — prevents hammering the API every tick.
+    'BRACKET_EMIR':      True,
+    'SL_UPDATE_ESIK':    0.0015,
+
+    # ── Slippage Control ──────────────────────────────────────────────────────
+    # LIMIT_EMIR       : True  = try a limit order first (maker fee, no
+    #                            slippage). Falls back to market after timeout.
+    #                    False = market order directly (original behaviour).
+    # LIMIT_BEKLEME_SN : seconds to wait for limit fill before falling back.
+    # MAX_KAYMA_PCT    : if current price has already moved more than this %
+    #                    from signal price, skip the trade (no chasing).
+    #                    0.003 = 0.3% (e.g. signal at 31.00, skip if >31.093)
+    'LIMIT_EMIR':        True,
+    'LIMIT_BEKLEME_SN':  10,
+    'MAX_KAYMA_PCT':     0.003,
 }
 
 # Validate weights sum to 1.0
@@ -203,6 +227,11 @@ sembol_ban_bitis   = {}   # {'HYPE/USDT': datetime(...)}  ban expiry
 
 # Position sync counter — increments each loop tick while in_position
 poz_sync_sayac = 0
+
+# Exchange-side bracket order IDs (set when BRACKET_EMIR=True)
+aktif_sl_order_id = None   # STOP_MARKET order ID on Binance
+aktif_tp_order_id = None   # TAKE_PROFIT_MARKET order ID on Binance
+son_exchange_sl   = 0.0    # Last SL price sent to exchange (for update threshold)
 
 # ==============================================================================
 # 3. EXCHANGE CONNECTION
@@ -253,6 +282,9 @@ def api_cagir(fn, *args, **kwargs):
 # 5. TELEGRAM BOT
 # ==============================================================================
 t_bot = telebot.TeleBot(CONFIG['TELEGRAM_TOKEN'])
+import logging
+telebot_logger = logging.getLogger('TeleBot')
+telebot_logger.setLevel(logging.CRITICAL)
 
 def telegram_mesaj_gonder(mesaj, reply_markup=None):
     try:
@@ -366,7 +398,7 @@ def cmd_durum(message):
             ban_str += f"  {sym} — {kalan}dk kaldi\n"
 
     telegram_mesaj_gonder(
-        f"<b>Bot Durum Raporu — v3.6</b>\n"
+        f"<b>Bot Durum Raporu — v3.7</b>\n"
         f"Durum   : {durum_str}\n"
         f"Kaldirac: {CONFIG['LEVERAGE']}x\n"
         f"Aktif s.: {_sembol if _sembol else '-'}\n"
@@ -839,6 +871,11 @@ def _saglik_thread():
         _bans   = {k: v for k, v in sembol_ban_bitis.items()
                    if v > datetime.now()}
 
+    with state_lock:
+        _sl_oid = aktif_sl_order_id
+        _tp_oid = aktif_tp_order_id
+        _ex_sl  = son_exchange_sl
+
     if _in_pos:
         f_now   = son_fiyat_al(_sembol)
         raw_pnl = (
@@ -848,11 +885,27 @@ def _saglik_thread():
         lev_pnl = raw_pnl * CONFIG['LEVERAGE'] * 100
         ok("Acik pozisyon", f"{_sembol} {_side}")
         ok("Giris / Simdi", f"{_entry:.4f} / {f_now:.4f}")
-        ok("SL", f"{_sl:.4f}")
-        if lev_pnl >= 0: ok("PnL", f"+%{lev_pnl:.2f}")
-        else:             uyari("PnL negatif", f"%{lev_pnl:.2f}")
+        ok("Yazilim SL",    f"{_sl:.4f}")
+        if CONFIG['BRACKET_EMIR']:
+            if _sl_oid:
+                ok("Exchange SL (STOP_MARKET)",
+                   f"AKTIF id={_sl_oid} fiyat={_ex_sl:.4f}")
+            else:
+                uyari("Exchange SL", "Order ID yok — bracket yerlesirilemedi")
+            if _tp_oid:
+                ok("Exchange TP (TAKE_PROFIT_MARKET)", f"AKTIF id={_tp_oid}")
+            else:
+                uyari("Exchange TP", "Order ID yok — bracket yerlesirilemedi")
+        else:
+            uyari("Bracket emir", "KAPALI — yazilim SL/TP aktif (risk yuksek)")
+        if lev_pnl >= 0: ok("ROI", f"+%{lev_pnl:.2f}")
+        else:             uyari("ROI negatif", f"%{lev_pnl:.2f}")
     else:
         ok("Pozisyon yok", "Sinyal bekleniyor")
+        if CONFIG['BRACKET_EMIR']:
+            ok("Bracket emir modu", "AKTIF")
+        else:
+            uyari("Bracket emir modu", "KAPALI — canli islemde BRACKET_EMIR=True onerilir")
 
     if _aktif: ok("Bot dongusu", "AKTIF")
     else:      hata("Bot dongusu", "DURDURULDU")
@@ -898,7 +951,7 @@ def _saglik_thread():
 @t_bot.message_handler(commands=['yardim', 'help'])
 def cmd_yardim(message):
     telegram_mesaj_gonder(
-        "<b>Komut Listesi — v3.6</b>\n"
+        "<b>Komut Listesi — v3.7</b>\n"
         "/durum       — Bot, pozisyon ve ban durumu\n"
         "/bakiye      — Cuzdan ve net kazanc\n"
         "/pnl         — PnL ozeti\n"
@@ -935,6 +988,223 @@ def get_balance():
 
 def ucret_hesapla(notional):
     return notional * CONFIG['TAKER_FEE'] * 2
+
+# ── Bracket Order Helpers ─────────────────────────────────────────────────────
+
+def bracket_emir_iptal(sembol):
+    """Cancel both SL and TP exchange-side orders if they exist."""
+    global aktif_sl_order_id, aktif_tp_order_id
+    for oid_attr in ['aktif_sl_order_id', 'aktif_tp_order_id']:
+        oid = globals()[oid_attr]
+        if oid:
+            try:
+                api_cagir(exchange.cancel_order, oid, sembol)
+                print(f"[Bracket] Iptal edildi: {oid_attr} = {oid}")
+            except Exception as e:
+                print(f"[Bracket Iptal] {oid_attr} iptal hatasi: {e}")
+            globals()[oid_attr] = None
+
+
+def bracket_emir_gonder(sembol, side, sl_fiyat, tp_fiyat):
+    """
+    Place STOP_MARKET (SL) and TAKE_PROFIT_MARKET (TP) on Binance.
+    Uses closePosition=True so no quantity is needed.
+    workingType=MARK_PRICE is more reliable than last price for stops.
+    Returns (sl_order_id, tp_order_id) — either may be None on failure.
+    """
+    global aktif_sl_order_id, aktif_tp_order_id, son_exchange_sl
+    close_side = 'sell' if side == 'AL' else 'buy'
+    sl_oid = None
+    tp_oid = None
+
+    # Round prices to exchange precision
+    try:
+        sl_fiyat = float(exchange.price_to_precision(sembol, sl_fiyat))
+        tp_fiyat = float(exchange.price_to_precision(sembol, tp_fiyat))
+    except Exception:
+        pass
+
+    # Place SL — STOP_MARKET
+    try:
+        sl_emir = api_cagir(
+            exchange.create_order,
+            sembol, 'STOP_MARKET', close_side, None, None,
+            params={
+                'stopPrice':    sl_fiyat,
+                'closePosition': True,
+                'reduceOnly':   True,
+                'workingType':  'MARK_PRICE',
+            }
+        )
+        sl_oid = sl_emir.get('id')
+        aktif_sl_order_id = sl_oid
+        son_exchange_sl   = sl_fiyat
+        print(f"[Bracket] STOP_MARKET yerlestirildi: {sl_fiyat} id={sl_oid}")
+    except Exception as e:
+        telegram_mesaj_gonder(
+            f"UYARI: Exchange-side SL yerleştirilemedi\n"
+            f"Sembol: {sembol}\n"
+            f"Hata: {str(e)[:80]}\n"
+            f"Bot yine de yazilim SL ile devam ediyor."
+        )
+        print(f"[Bracket SL Hatasi] {e}")
+
+    # Place TP — TAKE_PROFIT_MARKET
+    try:
+        tp_emir = api_cagir(
+            exchange.create_order,
+            sembol, 'TAKE_PROFIT_MARKET', close_side, None, None,
+            params={
+                'stopPrice':    tp_fiyat,
+                'closePosition': True,
+                'reduceOnly':   True,
+                'workingType':  'MARK_PRICE',
+            }
+        )
+        tp_oid = tp_emir.get('id')
+        aktif_tp_order_id = tp_oid
+        print(f"[Bracket] TAKE_PROFIT_MARKET yerlestirildi: {tp_fiyat} id={tp_oid}")
+    except Exception as e:
+        telegram_mesaj_gonder(
+            f"UYARI: Exchange-side TP yerleştirilemedi\n"
+            f"Sembol: {sembol}\n"
+            f"Hata: {str(e)[:80]}\n"
+            f"Bot yine de yazilim TP ile devam ediyor."
+        )
+        print(f"[Bracket TP Hatasi] {e}")
+
+    return sl_oid, tp_oid
+
+
+def sl_order_guncelle(sembol, side, yeni_sl):
+    """
+    Update the exchange-side STOP_MARKET if the new SL is at least
+    SL_UPDATE_ESIK better than the last sent price.
+    Binance doesn't support order modification, so: cancel + replace.
+    """
+    global aktif_sl_order_id, son_exchange_sl
+
+    if not CONFIG['BRACKET_EMIR']:
+        return
+    if aktif_sl_order_id is None:
+        return
+
+    # Check improvement threshold
+    if son_exchange_sl > 0:
+        if side == 'AL':
+            improvement = (yeni_sl - son_exchange_sl) / son_exchange_sl
+        else:
+            improvement = (son_exchange_sl - yeni_sl) / son_exchange_sl
+        if improvement < CONFIG['SL_UPDATE_ESIK']:
+            return   # Not improved enough — skip update
+
+    close_side = 'sell' if side == 'AL' else 'buy'
+    try:
+        yeni_sl_prec = float(exchange.price_to_precision(sembol, yeni_sl))
+    except Exception:
+        yeni_sl_prec = yeni_sl
+
+    # Cancel old SL
+    try:
+        api_cagir(exchange.cancel_order, aktif_sl_order_id, sembol)
+        aktif_sl_order_id = None
+    except Exception as e:
+        print(f"[SL Guncelle] Eski SL iptal hatasi: {e}")
+
+    # Place new SL
+    try:
+        yeni_emir = api_cagir(
+            exchange.create_order,
+            sembol, 'STOP_MARKET', close_side, None, None,
+            params={
+                'stopPrice':    yeni_sl_prec,
+                'closePosition': True,
+                'reduceOnly':   True,
+                'workingType':  'MARK_PRICE',
+            }
+        )
+        aktif_sl_order_id = yeni_emir.get('id')
+        son_exchange_sl   = yeni_sl_prec
+        print(f"[SL Guncelle] Yeni SL: {yeni_sl_prec} id={aktif_sl_order_id}")
+    except Exception as e:
+        print(f"[SL Guncelle] Yeni SL yerlesirme hatasi: {e}")
+
+
+# ── Limit Order Entry with Market Fallback ────────────────────────────────────
+
+def limit_emir_gonder(sembol, side_ccxt, miktar, referans_fiyat):
+    """
+    Attempt a limit order at the best bid (buy) or ask (sell).
+    Waits up to LIMIT_BEKLEME_SN seconds for fill.
+    Falls back to market order if unfilled.
+    Returns the fill order dict (same structure as create_market_order).
+    """
+    # Pre-entry slippage guard
+    try:
+        ticker     = api_cagir(exchange.fetch_ticker, sembol)
+        anlik_fiyat = float(ticker['last'])
+        kayma       = abs(anlik_fiyat - referans_fiyat) / referans_fiyat
+        if kayma > CONFIG['MAX_KAYMA_PCT']:
+            print(f"[Kayma Asimi] {sembol} referans:{referans_fiyat:.4f} "
+                  f"anlik:{anlik_fiyat:.4f} kayma:%{kayma*100:.3f} — ATLA")
+            telegram_mesaj_gonder(
+                f"Giris atildi — kayma fazla\n"
+                f"Sembol  : {sembol}\n"
+                f"Sinyal  : {referans_fiyat:.4f}\n"
+                f"Su an   : {anlik_fiyat:.4f}\n"
+                f"Kayma   : %{kayma*100:.3f} (max %{CONFIG['MAX_KAYMA_PCT']*100:.2f})"
+            )
+            return None
+
+        # Set limit price: buy at best ask, sell at best bid (instant fill attempt)
+        if side_ccxt == 'buy':
+            limit_fiyat = float(ticker.get('ask') or anlik_fiyat)
+        else:
+            limit_fiyat = float(ticker.get('bid') or anlik_fiyat)
+
+        limit_fiyat = float(exchange.price_to_precision(sembol, limit_fiyat))
+    except Exception as e:
+        print(f"[Limit Emir] Ticker hatasi, market order'a geciliyor: {e}")
+        return api_cagir(exchange.create_market_order, sembol, side_ccxt, miktar)
+
+    # Place limit order
+    try:
+        limit_emir = api_cagir(
+            exchange.create_limit_order,
+            sembol, side_ccxt, miktar, limit_fiyat,
+            params={'timeInForce': 'GTC'}
+        )
+        emir_id = limit_emir.get('id')
+        print(f"[Limit Emir] Yerlestirildi: {limit_fiyat} id={emir_id}")
+    except Exception as e:
+        print(f"[Limit Emir] Limit basarisiz, market'e geciliyor: {e}")
+        return api_cagir(exchange.create_market_order, sembol, side_ccxt, miktar)
+
+    # Wait for fill
+    bitis = time.time() + CONFIG['LIMIT_BEKLEME_SN']
+    while time.time() < bitis:
+        time.sleep(1)
+        try:
+            durum = api_cagir(exchange.fetch_order, emir_id, sembol)
+            if durum.get('status') == 'closed':
+                print(f"[Limit Emir] Dolduruldu: {durum.get('average')}")
+                return durum
+            if durum.get('status') in ('canceled', 'rejected', 'expired'):
+                print(f"[Limit Emir] Iptal/Reddedildi: {durum.get('status')}")
+                break
+        except Exception as e:
+            print(f"[Limit Emir Kontrol] {e}")
+            break
+
+    # Cancel unfilled limit and fall back to market
+    try:
+        api_cagir(exchange.cancel_order, emir_id, sembol)
+        print(f"[Limit Emir] Dolmadiginda iptal, market'e geciliyor")
+    except Exception as e:
+        print(f"[Limit Iptal] {e}")
+
+    return api_cagir(exchange.create_market_order, sembol, side_ccxt, miktar)
+
 
 def tp_orani_hesapla():
     """
@@ -1533,7 +1803,8 @@ def trade_loop():
     global active_side, active_sembol, bot_aktif_mi, son_rapor_zamani
     global highest_price, lowest_price, breakeven_reached
     global kayip_sonrasi_bekleme, son_tarama_sonuclari
-    global sembol_kayip_sayac, sembol_ban_bitis
+    global sembol_kayip_sayac, sembol_ban_bitis, poz_sync_sayac
+    global aktif_sl_order_id, aktif_tp_order_id, son_exchange_sl
 
     print("[AKTIF] Multi-symbol tarama dongusu baslatildi.")
     HEARTBEAT_SANIYE = CONFIG['HEARTBEAT_DAKIKA'] * 60
@@ -1643,10 +1914,23 @@ def trade_loop():
                     )
                     if miktar > 0:
                         side_ccxt = 'buy' if sinyal == 'AL' else 'sell'
-                        emir      = api_cagir(
-                            exchange.create_market_order,
-                            sembol, side_ccxt, miktar
-                        )
+
+                        # ── Slippage-controlled entry [Fix 2] ─────────────────
+                        if CONFIG['LIMIT_EMIR']:
+                            emir = limit_emir_gonder(
+                                sembol, side_ccxt, miktar, fiyat
+                            )
+                        else:
+                            emir = api_cagir(
+                                exchange.create_market_order,
+                                sembol, side_ccxt, miktar
+                            )
+
+                        # limit_emir_gonder returns None if slippage guard fires
+                        if emir is None:
+                            time.sleep(CONFIG['LOOP_UYKU'])
+                            continue
+
                         with state_lock:
                             in_position       = True
                             active_side       = sinyal
@@ -1671,6 +1955,12 @@ def trade_loop():
                             if sinyal == 'AL'
                             else _entry_snap * (1 - _tp_oran)
                         )
+
+                        # ── Exchange-side bracket orders [Fix 1] ──────────────
+                        if CONFIG['BRACKET_EMIR']:
+                            bracket_emir_gonder(
+                                sembol, sinyal, _sl_snap, tp_fiyat
+                            )
                         hacim_usd = round(miktar * _entry_snap, 2)
                         ucret     = round(ucret_hesapla(hacim_usd), 4)
                         slippage  = abs(_entry_snap - fiyat) / fiyat * 100
@@ -1725,6 +2015,7 @@ def trade_loop():
                             f"Ucret est: {ucret} USDT\n"
                             f"Diger sin: {diger_str}"
                             f"{slip_str}"
+                            f"\nBracket  : {'AKTIF (exchange SL+TP)' if CONFIG['BRACKET_EMIR'] else 'KAPALI (yazilim)'}"
                         )
 
             # STEP D: Manage open position
@@ -1748,6 +2039,8 @@ def trade_loop():
                         )
                         if not hala_acik:
                             # Position closed externally (manual, liquidation, etc.)
+                            if CONFIG['BRACKET_EMIR']:
+                                bracket_emir_iptal(_sembol)
                             with state_lock:
                                 in_position       = False
                                 active_side       = ""
@@ -1759,6 +2052,9 @@ def trade_loop():
                                 lowest_price      = 0.0
                                 breakeven_reached = False
                                 poz_sync_sayac    = 0
+                                aktif_sl_order_id = None
+                                aktif_tp_order_id = None
+                                son_exchange_sl   = 0.0
                             telegram_mesaj_gonder(
                                 f"Pozisyon harici kapatildi tespit edildi\n"
                                 f"Sembol : {_sembol}\n"
@@ -1776,8 +2072,13 @@ def trade_loop():
                     continue
 
                 with state_lock:
+                    _prev_sl = stop_loss
                     trailing_stop_guncelle(fiyat)
                     _sl = stop_loss
+
+                # Update exchange-side SL if trailing moved enough [Fix 1]
+                if CONFIG['BRACKET_EMIR'] and _sl != _prev_sl:
+                    sl_order_guncelle(_sembol, _side, _sl)
 
                 raw_pnl      = (
                     (fiyat - _entry) / _entry if _side == 'AL'
@@ -1803,11 +2104,31 @@ def trade_loop():
                     neden_str = "TAKE PROFIT" if is_tp else "STOP LOSS"
                     exit_side = 'sell' if _side == 'AL' else 'buy'
 
-                    api_cagir(
-                        exchange.create_market_order,
-                        _sembol, exit_side, _miktar,
-                        params={'reduceOnly': True}
-                    )
+                    # Cancel bracket orders before sending software close [Fix 1]
+                    # (prevents double-close if exchange already filled one)
+                    if CONFIG['BRACKET_EMIR']:
+                        bracket_emir_iptal(_sembol)
+
+                    # Check if exchange already closed it via bracket order
+                    try:
+                        syms_chk    = [_sembol + ':USDT']
+                        poz_chk     = api_cagir(exchange.fetch_positions, syms_chk)
+                        hala_var    = any(
+                            float(p.get('contracts', 0) or 0) > 0
+                            for p in poz_chk
+                        )
+                    except Exception:
+                        hala_var = True  # assume still open on API error
+
+                    if hala_var:
+                        api_cagir(
+                            exchange.create_market_order,
+                            _sembol, exit_side, _miktar,
+                            params={'reduceOnly': True}
+                        )
+                    else:
+                        print(f"[Kapan] Pozisyon zaten exchange tarafindan kapatilmis")
+
                     yeni_bakiye = get_balance()
 
                     log_trade({
@@ -1876,6 +2197,9 @@ def trade_loop():
                         highest_price     = 0.0
                         lowest_price      = 0.0
                         breakeven_reached = False
+                        aktif_sl_order_id = None
+                        aktif_tp_order_id = None
+                        son_exchange_sl   = 0.0
 
             time.sleep(CONFIG['LOOP_UYKU'])
 
@@ -1889,7 +2213,7 @@ def trade_loop():
 # ==============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Multi-Symbol Bot v3.6')
+    parser = argparse.ArgumentParser(description='Multi-Symbol Bot v3.7')
     parser.add_argument(
         '--backtest-only', action='store_true',
         help='Run backtest for all symbols then exit'
@@ -1937,7 +2261,7 @@ if __name__ == "__main__":
         )
 
         telegram_mesaj_gonder(
-            f"<b>Bot Baslatildi — v3.6</b>\n"
+            f"<b>Bot Baslatildi — v3.7</b>\n"
             f"Tarama listesi:\n{sembol_listesi_str}\n"
             f"Kaldirac   : {CONFIG['LEVERAGE']}x\n"
             f"Risk/islem : %{CONFIG['RISK_ORANI']*100:.0f}\n"
