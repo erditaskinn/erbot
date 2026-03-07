@@ -1,21 +1,31 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         MULTI-SYMBOL FUTURES SCANNER + TRADING BOT  —  v3.7               ║
+║      MULTI-SYMBOL FUTURES SCANNER + TRADING BOT  —  v3.9                  ║
 ║                                                                              ║
-║  New in v3.7 (full audit + consistency pass):                               ║
-║  [A]  5 new indicators added to scoring engine                              ║
-║         StochRSI (K/D), MACD histogram, EMA21, OBV, Candle direction       ║
-║  [B]  Scoring rebuilt: 7 factors + candle multiplier, weights rebalanced    ║
-║  [C]  Per-symbol consecutive-SL ban (2 losses → 30min cooldown)            ║
-║  [D]  Score jitter to prevent same symbol winning every scan                ║
-║  [E]  RSI thresholds tightened (38→35 / 62→65)                             ║
-║  [F]  /durum shows active symbol bans                                       ║
-║  [G]  /piyasa shows all 7 indicator values                                  ║
+║  MAJOR CHANGES IN v3.9 (full architectural overhaul):                       ║
 ║                                                                              ║
-║  Carried from v3.2 (all fixes intact):                                      ║
-║  Polling restart loop, fetch_positions symbol filter, backtest SL price,   ║
-║  /tara fresh results, thread lock, health check session bypass,             ║
-║  backtest rate limit sleep, /piyasa best symbol                             ║
+║  [1]  MULTI-POSITION: up to 3 concurrent positions across different symbols ║
+║       active_positions dict replaces single in_position bool                ║
+║  [2]  WATCHLIST EXPANDED: 8 → 16 symbols (SUI WIF PEPE INJ OP TIA JUP BONK)║
+║  [3]  RSI REMOVED from scoring (StochRSI already covers it better)         ║
+║  [4]  BTC TREND: hard gate removed → 8th scoring factor (0.04 weight)      ║
+║  [5]  JITTER REMOVED: random noise replaced by correlation filter           ║
+║  [6]  CORRELATION FILTER: no two same-category positions simultaneously     ║
+║  [7]  ASYMMETRIC TP: separate ROI targets for AL vs SAT                    ║
+║  [8]  ASYMMETRIC SL: wider ATR multiplier for SAT (shorts get squeezed)    ║
+║  [9]  MAX HOLD TIME: positions auto-closed after N hours with no SL/TP     ║
+║  [10] PARTIAL TP (SCALE-OUT): close 60% at TP1, ride 40% to TP2           ║
+║  [11] DYNAMIC LEVERAGE: ADX-based leverage scaling per trade               ║
+║  [12] GRADIENT EMA21 SCORING: replaces binary above/below                  ║
+║  [13] FUNDING RATE BONUS: high positive funding rewards SAT positions      ║
+║  [14] COOLDOWN: tick-based → time-based (real datetime)                    ║
+║  [15] SESSION FILTER: dead code removed entirely                            ║
+║  [16] /istatistik: symbol/direction/hour breakdown from trade log           ║
+║  [17] /kapat SEMBOL: close specific position (multi-pos aware)             ║
+║                                                                              ║
+║  Carried from v3.8 (all intact):                                            ║
+║  Exchange bracket orders, limit entry, slippage guard, position sync,      ║
+║  per-symbol ban, polling shutdown fix, ROI-mode TP, /saglik, /durum        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -24,10 +34,10 @@ import pandas as pd
 import csv
 import os
 import sys
+import logging
 import telebot
 import threading
 import argparse
-import random
 from telebot import types
 from datetime import datetime, timedelta, timezone
 from ta.trend import ADXIndicator, EMAIndicator, MACD
@@ -37,6 +47,10 @@ from ta.volume import OnBalanceVolumeIndicator
 from dotenv import load_dotenv
 import time
 
+# Suppress TeleBot "Break infinity polling" spam on shutdown
+telebot_logger = logging.getLogger('TeleBot')
+telebot_logger.setLevel(logging.CRITICAL)
+
 load_dotenv()
 
 # ==============================================================================
@@ -44,194 +58,197 @@ load_dotenv()
 # ==============================================================================
 CONFIG = {
     # ── Credentials ───────────────────────────────────────────────────────────
-    'API_KEY':           os.environ.get('BINANCE_API_KEY',    'YOUR_API_KEY_HERE'),
-    'SECRET_KEY':        os.environ.get('BINANCE_SECRET_KEY', 'YOUR_SECRET_KEY_HERE'),
-    'TELEGRAM_TOKEN':    os.environ.get('TELEGRAM_TOKEN',     'YOUR_TELEGRAM_TOKEN_HERE'),
-    'CHAT_ID':           os.environ.get('TELEGRAM_CHAT_ID',   'YOUR_CHAT_ID_HERE'),
+    'API_KEY':        os.environ.get('BINANCE_API_KEY',    'YOUR_API_KEY_HERE'),
+    'SECRET_KEY':     os.environ.get('BINANCE_SECRET_KEY', 'YOUR_SECRET_KEY_HERE'),
+    'TELEGRAM_TOKEN': os.environ.get('TELEGRAM_TOKEN',     'YOUR_TELEGRAM_TOKEN_HERE'),
+    'CHAT_ID':        os.environ.get('TELEGRAM_CHAT_ID',   'YOUR_CHAT_ID_HERE'),
 
-    # ── Watchlist ─────────────────────────────────────────────────────────────
-    'SEMBOL_LISTESI': [
-        'RENDER/USDT',
-        'SOL/USDT',
-        'ETH/USDT',
-        'BNB/USDT',
-        'AVAX/USDT',
-        'DOGE/USDT',
-        'LINK/USDT',
-        'ARB/USDT',
+    # ── Watchlist (16 symbols) [v3.9 expanded] ────────────────────────────────
+    'SYMBOL_LIST': [
+        'HYPE/USDT', 'SOL/USDT',  'ETH/USDT',  'BNB/USDT',
+        'AVAX/USDT', 'DOGE/USDT', 'LINK/USDT',  'ARB/USDT',
+        'SUI/USDT',  'WIF/USDT',  'INJ/USDT',   'OP/USDT',
+        'TIA/USDT',  'JUP/USDT',
+        # PEPE/USDT and BONK/USDT removed — not available on Binance demo futures.
+        # Add them back when switching to live trading if needed.
     ],
-    'BTC_SEMBOL': 'BTC/USDT',
+    # Correlation categories — no two same-category positions allowed
+    # simultaneously (prevents doubling exposure on correlated moves)
+    'SYMBOL_CATEGORIES': {
+        'HYPE/USDT': 'others',
+        'SOL/USDT':  'l1',    'AVAX/USDT': 'l1',
+        'SUI/USDT':  'l1',    'INJ/USDT':  'l1',  'TIA/USDT': 'l1',
+        'ETH/USDT':  'large', 'BNB/USDT':  'large',
+        'ARB/USDT':  'l2',    'OP/USDT':   'l2',
+        'LINK/USDT': 'defi',  'JUP/USDT':  'defi',
+        'DOGE/USDT': 'meme',  'WIF/USDT':  'meme',
+        # 'PEPE/USDT': 'meme',  'BONK/USDT': 'meme',  # demo only
+    },
+    # Categories where multiple concurrent positions ARE allowed
+    # (less correlated with each other than same-bucket coins)
+    'CORRELATION_FREE': {'large', 'l2', 'defi', 'others'},
+    'BTC_SYMBOL': 'BTC/USDT',
 
     # ── Timeframes ────────────────────────────────────────────────────────────
-    # ENTRY_TF : candle size for signal detection and indicator calculation.
-    #            '5m'  = ~4-12 signals/day across 8 symbols (recommended)
-    #            '3m'  = more signals, more noise
-    #            '15m' = fewer signals, higher quality — swing trading style
-    # BIAS_TF  : higher timeframe trend confirmation. Should be 3x ENTRY_TF.
-    #            '15m' pairs with '5m' entry (recommended)
-    #            '1h'  pairs with '15m' entry
-    # BTC_TF   : macro BTC trend. '1h' is fine for all entry timeframes.
-    'LEVERAGE':   5,
-    'ENTRY_TF':   '5m',    # <-- change here to adjust signal timeframe
-    'BIAS_TF':    '15m',   # <-- should be 3x ENTRY_TF
-    'BTC_TF':     '1h',
+    # ENTRY_TF : '5m' = 4-12 signals/day | '3m' = more noise | '15m' = swing
+    # BIAS_TF  : should be 3× ENTRY_TF
+    'ENTRY_TF': '5m',
+    'BIAS_TF':  '15m',
+    'BTC_TF':   '1h',
+
+    # ── Leverage — Dynamic [v3.9] ─────────────────────────────────────────────
+    # LEVERAGE        : base leverage for all trades.
+    # DYNAMIC_LEVERAGE: True = add 1x leverage per 10 ADX points above ADX_THRESHOLD.
+    #   e.g. ADX=22 → 5x | ADX=32 → 6x | ADX=42 → 7x
+    # MAX_LEVERAGE    : hard ceiling regardless of ADX.
+    'LEVERAGE':         5,
+    'DYNAMIC_LEVERAGE': True,
+    'MAX_LEVERAGE':     8,
+
+    # ── Multi-Position [v3.9] ─────────────────────────────────────────────────
+    # MAX_CONCURRENT_POSITIONS : max concurrent open positions.
+    # MAX_TOTAL_MARGIN_PCT  : max total margin deployed as fraction of balance.
+    #   0.06 = 6% of balance across ALL open positions combined.
+    'MAX_CONCURRENT_POSITIONS': 3,
+    'MAX_TOTAL_MARGIN_PCT':  0.24,   # 24% = $1200 max total margin across all positions
 
     # ── Risk Management ───────────────────────────────────────────────────────
-    # RISK_ORANI      : % of account risked per trade.
-    #                   0.01 = 1%  (conservative, safe for testing)
-    #                   0.02 = 2%  (moderate — recommended after demo testing)
-    #                   0.03 = 3%  (aggressive — only if win rate above 50%)
-    #                   Never go above 0.03 with 5x leverage.
-    #
-    # GUNLUK_MAX_ZARAR: daily loss limit as fraction of account.
-    #                   0.05 = 5%  (stops bot after 5% daily loss)
-    #
-    # TP MODES — two options, only one is active at a time:
-    # ─────────────────────────────────────────────────────
-    # Option A: Price-move TP (TP_ROI_MOD = False)
-    #   TP_ORANI = raw asset price move required to close.
-    #   0.02 = 2% price move.  With 5x leverage → 10% ROI.
-    #   Formula: ROI = TP_ORANI × LEVERAGE
-    #   Inconsistent: changing leverage changes your actual return.
-    #
-    # Option B: ROI-based TP (TP_ROI_MOD = True)  ← RECOMMENDED
-    #   TP_ROI_HEDEF = target return ON MARGIN (what you actually care about).
-    #   0.10 = 10% ROI on margin regardless of leverage.
-    #   The bot converts this to the correct price move automatically.
-    #   Formula: price_move_needed = TP_ROI_HEDEF / LEVERAGE
-    #   Consistent: changing leverage never changes your target return.
-    # ─────────────────────────────────────────────────────
-    'TP_ROI_MOD':       True,   # True = ROI-based (recommended) | False = price-move
-    'TP_ROI_HEDEF':     0.10,   # ROI target per trade: 0.10 = 10% on margin
-    'TP_ORANI':         0.02,   # Used only when TP_ROI_MOD = False
-    #
-    # ATR_SL_CARPAN   : stop loss distance in ATR multiples.
-    #                   1.5 = tight (faster SL, less room for noise)
-    #                   2.0 = loose (more room, larger loss if SL hit)
-    'RISK_ORANI':       0.05,
-    'GUNLUK_MAX_ZARAR': 0.05,
-    'ATR_SL_CARPAN':    1.5,
-    'BREAKEVEN_TETIK':  0.008,
-    'TRAILING_ADIM':    0.005,
+    # RISK_PCT      : % of account risked PER TRADE.
+    # DAILY_MAX_LOSS: daily loss limit — bot stops after this fraction lost.
+    # MAX_POSITION_USD: hard notional cap per single position (0 = disabled).
+    # MAX_POSITION_HOURS: auto-close position if open longer than N hours.
+    'RISK_PCT':              0.08,   # 8% = ~$400 max loss per trade on $5000 balance
+    'DAILY_MAX_LOSS':        0.10,   # 10% daily stop = ~$500 max daily loss
+    'MAX_POSITION_USD':      2500,   # $2500 notional per position (~$500 margin at 5x)
+    'MAX_POSITION_HOURS':  4,
+
+    # ── TP Configuration — Asymmetric [v3.9] ─────────────────────────────────
+    # TP_ROI_MODE     : True = ROI-on-margin target | False = raw price move.
+    # TP_ROI_TARGET   : ROI target for AL positions. 0.10 = 10% on margin.
+    # TP_ROI_TARGET_SHORT: ROI target for SAT positions (tighter — shorts move fast).
+    # TP_RATE       : used only when TP_ROI_MODE = False.
+    'TP_ROI_MODE':       True,
+    'TP_ROI_TARGET':     0.10,
+    'TP_ROI_TARGET_SHORT': 0.12,   # raised from 0.07 — needed to keep R:R near 0.9x with 1.6x SL
+    'TP_RATE':         0.02,
+
+    # ── Partial TP / Scale-Out [v3.9] ─────────────────────────────────────────
+    # PARTIAL_TP_ACTIVE  : True = close PARTIAL_TP_PCT at TP1, ride rest to TP2.
+    # PARTIAL_TP_PCT  : fraction closed at TP1. 0.60 = close 60%, ride 40%.
+    # TP2_ROI_TARGET   : ROI target for the remaining 40% (applies to both sides).
+    'PARTIAL_TP_ACTIVE':   True,
+    'PARTIAL_TP_PCT':   0.60,
+    'TP2_ROI_TARGET':    0.15,   # lowered from 0.20 — more reachable on 5m timeframe
+
+    # ── SL Configuration — Asymmetric [v3.9] ─────────────────────────────────
+    # Shorts get squeezed harder in crypto (structurally bullish market).
+    # SAT positions get a wider SL to avoid stop-hunts.
+    'ATR_SL_MULT_LONG':  1.2,   # tightened from 1.5 — improves R:R, reduces loss per SL hit
+    'ATR_SL_MULT_SHORT': 1.6,   # tightened from 2.0 — pairs with raised SHORT TP below
+    'BREAKEVEN_TRIGGER':   0.008,
+    'TRAILING_STEP':     0.005,
 
     # ── Signal Hard Gates ─────────────────────────────────────────────────────
-    # STOCH_ASIRI_SATIS: StochRSI K gate for AL (replaces slow RSI gate).
-    #   0.20 = K<20% required (recommended) | 0.25 = more signals
-    # STOCH_ASIRI_ALIS : StochRSI K gate for SAT.
-    #   0.80 = K>80% required (recommended) | 0.75 = more signals
-    # RSI values below are SCORE contributors only, not hard gates.
-    'ADX_ESIK':          22,
-    'STOCH_ASIRI_SATIS': 0.20,
-    'STOCH_ASIRI_ALIS':  0.80,
-    'RSI_ASIRI_SATIS':   40,
-    'RSI_ASIRI_ALIS':    60,
-    'HACIM_CARPAN':      1.5,
-    'MIN_ATR_YUZDE':     0.003,
+    # Only 3 hard gates remain: ADX, StochRSI, volume.
+    # BTC trend and HTF bias are now SCORE FACTORS only.
+    # RSI removed entirely — StochRSI is strictly superior.
+    'ADX_THRESHOLD':          18,
+    'STOCH_OVERSOLD': 0.30,
+    'STOCH_OVERBOUGHT':  0.70,
+    'VOLUME_MULT':      1.2,
+    'MIN_ATR_PCT':     0.002,
     'MAX_FUNDING_RATE':  0.0003,
 
-    # ── Scoring Weights (7 factors + candle multiplier) [New A/B] ─────────────
-    # All weights must sum to 1.0
-    'SKOR_ADX_W':   0.18,   # trend strength
-    'SKOR_RSI_W':   0.12,   # RSI extremity (reduced — StochRSI now covers this better)
-    'SKOR_VOL_W':   0.12,   # volume surge
-    'SKOR_STOCH_W': 0.16,   # StochRSI K position + K>D crossover bonus
-    'SKOR_MACD_W':  0.18,   # MACD histogram direction (2-candle momentum)
-    'SKOR_EMA21_W': 0.12,   # price position relative to EMA21
-    'SKOR_OBV_W':   0.12,   # OBV vs its EMA20 (volume quality)
-    # Candle direction multiplier: x1.10 if confirms signal, x0.90 if opposes
+    # ── Scoring Weights — 8 factors + candle multiplier [v3.9] ────────────────
+    # RSI removed. BTC trend added. All weights sum to 1.0.
+    'SCORE_STOCH_W': 0.20,   # StochRSI K position + K/D crossover bonus
+    'SCORE_MACD_W':  0.20,   # MACD histogram direction (2-candle momentum)
+    'SCORE_ADX_W':   0.16,   # trend strength
+    'SCORE_EMA21_W': 0.12,   # gradient price distance from EMA21
+    'SCORE_OBV_W':   0.12,   # OBV vs its EMA20 (volume quality)
+    'SCORE_VOL_W':   0.10,   # volume surge ratio
+    'SCORE_BIAS_W':  0.06,   # 15m HTF bias alignment
+    'SCORE_BTC_W':   0.04,   # BTC 1h trend alignment
+    # Candle multiplier: ×1.10 if signal candle confirms direction, ×0.90 if not.
 
-    # ── Per-Symbol Ban [New C] ─────────────────────────────────────────────────
-    'MAX_AYNI_SEMBOL_KAYIP': 2,    # consecutive SLs before ban
-    'SEMBOL_BAN_DAKIKA':     30,   # ban duration in minutes
+    # ── Per-Symbol Ban ─────────────────────────────────────────────────────────
+    'MAX_CONSECUTIVE_LOSSES': 2,
+    'SYMBOL_BAN_MINUTES':     30,
 
-    # ── Score Jitter [New D] ───────────────────────────────────────────────────
-    # Adds ±JITTER_PCT random noise to break ties (prevents HYPE always winning)
-    'SKOR_JITTER_PCT': 0.03,   # ±3% of score
-
-    # ── Session Filter (UTC) ──────────────────────────────────────────────────
-    # Crypto trades 24/7 so this is OFF by default.
-    # Set True + adjust hours if you want to restrict to liquid hours only.
-    'SESSION_BASLANGIC': 13,
-    'SESSION_BITIS':     22,
-    'SESSION_FILTRE':    False,   # False = trade 24/7 (recommended for crypto)
+    # ── Cooldown after loss — time-based [v3.9] ───────────────────────────────
+    # After any SL, bot waits this many minutes before opening a NEW position.
+    # Set to 0 to disable. (Circuit breaker still works independently.)
+    'LOSS_COOLDOWN_MINUTES': 5,
 
     # ── Fees ──────────────────────────────────────────────────────────────────
     'TAKER_FEE': 0.0004,
 
-    # ── System ────────────────────────────────────────────────────────────────
-    'LOG_FILE':          'trade_log.csv',
-    'HEARTBEAT_DAKIKA':  5,
-    'LOOP_UYKU':         15,
-    'GIRIS_COOLDOWN':    3,
-    'MAX_RETRY':         5,
-    # POZ_SYNC_ARALIK: how often (in loop ticks) to verify position still
-    # exists on the exchange. Catches manual closes, liquidations, etc.
-    # 4 ticks × 15s = every 60 seconds. Lower = more API calls.
-    'POZ_SYNC_ARALIK':   4,
-
     # ── Exchange-Side Bracket Orders ──────────────────────────────────────────
-    # BRACKET_EMIR     : True  = place STOP_MARKET + TAKE_PROFIT_MARKET on
-    #                            Binance the instant a trade opens. Position is
-    #                            protected even if this bot crashes or loses
-    #                            internet. STRONGLY RECOMMENDED for live trading.
-    #                    False = software-only SL/TP (original behaviour).
-    # SL_UPDATE_ESIK   : only update the exchange-side STOP_MARKET when the
-    #                    trailing stop improves by at least this fraction.
-    #                    0.0015 = 0.15% — prevents hammering the API every tick.
-    'BRACKET_EMIR':      True,
-    'SL_UPDATE_ESIK':    0.0015,
+    # BRACKET_ORDERS : True = STOP_MARKET + TAKE_PROFIT_MARKET placed on Binance
+    #                immediately after entry. Bot crash = position still safe.
+    # SL_UPDATE_THRESHOLD: min improvement fraction before updating exchange SL.
+    'BRACKET_ORDERS':   True,
+    'SL_UPDATE_THRESHOLD': 0.0015,
 
     # ── Slippage Control ──────────────────────────────────────────────────────
-    # LIMIT_EMIR       : True  = try a limit order first (maker fee, no
-    #                            slippage). Falls back to market after timeout.
-    #                    False = market order directly (original behaviour).
-    # LIMIT_BEKLEME_SN : seconds to wait for limit fill before falling back.
-    # MAX_KAYMA_PCT    : if current price has already moved more than this %
-    #                    from signal price, skip the trade (no chasing).
-    #                    0.003 = 0.3% (e.g. signal at 31.00, skip if >31.093)
-    'LIMIT_EMIR':        True,
-    'LIMIT_BEKLEME_SN':  10,
-    'MAX_KAYMA_PCT':     0.003,
+    # LIMIT_ORDER     : True = try limit at best bid/ask first, fallback market.
+    # LIMIT_WAIT_SECONDS: seconds to wait for fill before falling back.
+    # MAX_SLIPPAGE_PCT  : skip trade if price already moved this far from signal.
+    'LIMIT_ORDER':        True,
+    'LIMIT_WAIT_SECONDS':  10,
+    'MAX_SLIPPAGE_PCT':     0.003,
+
+    # ── System ────────────────────────────────────────────────────────────────
+    'LOG_FILE':          'trade_log.csv',
+    'HEARTBEAT_MINUTES':  5,
+    'LOOP_SLEEP':         10,
+    'MAX_RETRY':         5,
+    'POSITION_SYNC_INTERVAL':   4,
 }
 
-# Validate weights sum to 1.0
-_weight_sum = (CONFIG['SKOR_ADX_W'] + CONFIG['SKOR_RSI_W'] +
-               CONFIG['SKOR_VOL_W'] + CONFIG['SKOR_STOCH_W'] +
-               CONFIG['SKOR_MACD_W'] + CONFIG['SKOR_EMA21_W'] +
-               CONFIG['SKOR_OBV_W'])
-assert abs(_weight_sum - 1.0) < 0.001, f"Scoring weights must sum to 1.0, got {_weight_sum}"
+# Validate scoring weights
+_wsum = sum(CONFIG[k] for k in CONFIG if k.startswith('SCORE_') and k.endswith('_W'))
+assert abs(_wsum - 1.0) < 0.001, f"Scoring weights must sum to 1.0, got {_wsum}"
 
 # ==============================================================================
-# 2. GLOBAL STATE + THREAD LOCK
+# 2. GLOBAL STATE
 # ==============================================================================
 state_lock = threading.Lock()
 
-bot_aktif_mi          = True
-in_position           = False
-active_side           = ""
-active_sembol         = ""
-entry_price           = 0.0
-active_miktar         = 0.0
-stop_loss             = 0.0
-highest_price         = 0.0
-lowest_price          = 0.0
-breakeven_reached     = False
-baslangic_bakiye      = 0.0
-son_rapor_zamani      = datetime.now()
-kayip_sonrasi_bekleme = 0
-son_tarama_sonuclari  = []
+# Multi-position state [v3.9]
+# Key: symbol string e.g. 'HYPE/USDT'
+# Value: dict with all position data
+active_positions = {}
+# Structure of each position:
+# {
+#   'side':             'LONG' | 'SHORT',
+#   'entry_price':      float,
+#   'qty':           float,    # current quantity (reduced after partial TP)
+#   'qty_full':       float,    # original full quantity at entry
+#   'atr':              float,
+#   'leverage':         int,
+#   'stop_loss':        float,
+#   'highest_price':    float,
+#   'lowest_price':     float,
+#   'breakeven_reached':bool,
+#   'partial_tp_done':  bool,     # True after TP1 partial close executed
+#   'open_time':        datetime,
+#   'sl_order_id':      str|None,
+#   'tp_order_id':      str|None,
+#   'last_exchange_sl':  float,
+# }
 
-# Per-symbol ban state [New C]
-sembol_kayip_sayac = {}   # {'HYPE/USDT': 2, ...}  consecutive SL count
-sembol_ban_bitis   = {}   # {'HYPE/USDT': datetime(...)}  ban expiry
+bot_active        = True
+start_balance    = 0.0
+last_report_time    = datetime.now()
+last_scan_results = []
 
-# Position sync counter — increments each loop tick while in_position
-poz_sync_sayac = 0
+# Per-symbol ban
+symbol_loss_count = {}   # {symbol: consecutive_sl_count}
+symbol_ban_until   = {}   # {symbol: datetime}
 
-# Exchange-side bracket order IDs (set when BRACKET_EMIR=True)
-aktif_sl_order_id = None   # STOP_MARKET order ID on Binance
-aktif_tp_order_id = None   # TAKE_PROFIT_MARKET order ID on Binance
-son_exchange_sl   = 0.0    # Last SL price sent to exchange (for update threshold)
+# Cooldown after loss — real datetime [v3.9]
+loss_cooldown_until = None   # datetime when cooldown expires
 
 # ==============================================================================
 # 3. EXCHANGE CONNECTION
@@ -257,20 +274,18 @@ except AttributeError:
     exchange.urls['api']['fapi']          = f'{demo_base}/fapi'
 
 # ==============================================================================
-# 4. EXPONENTIAL BACKOFF API WRAPPER
+# 4. API WRAPPER WITH EXPONENTIAL BACKOFF
 # ==============================================================================
-def api_cagir(fn, *args, **kwargs):
+def api_call(fn, *args, **kwargs):
     bekleme = 10
     for deneme in range(CONFIG['MAX_RETRY']):
         try:
             return fn(*args, **kwargs)
         except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
             if deneme == CONFIG['MAX_RETRY'] - 1:
-                telegram_mesaj_gonder(
-                    f"API Baglanti Hatasi (5 deneme basarisiz):\n{e}"
-                )
+                send_telegram(f"API Baglanti Hatasi (5 deneme):\n{e}")
                 raise
-            print(f"[API Retry {deneme+1}] {e} — {bekleme}s bekleniyor")
+            print(f"[API Retry {deneme+1}] {e} — {bekleme}s")
             time.sleep(bekleme)
             bekleme *= 2
         except ccxt.RateLimitExceeded:
@@ -279,14 +294,11 @@ def api_cagir(fn, *args, **kwargs):
             raise
 
 # ==============================================================================
-# 5. TELEGRAM BOT
+# 5. TELEGRAM
 # ==============================================================================
 t_bot = telebot.TeleBot(CONFIG['TELEGRAM_TOKEN'])
-import logging
-telebot_logger = logging.getLogger('TeleBot')
-telebot_logger.setLevel(logging.CRITICAL)
 
-def telegram_mesaj_gonder(mesaj, reply_markup=None):
+def send_telegram(mesaj, reply_markup=None):
     try:
         t_bot.send_message(
             CONFIG['CHAT_ID'], mesaj,
@@ -296,7 +308,7 @@ def telegram_mesaj_gonder(mesaj, reply_markup=None):
     except Exception as e:
         print(f"[Telegram Hatasi] {e}")
 
-def ana_klavye():
+def main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     kb.add(
         types.KeyboardButton("Durum"),
@@ -315,6 +327,8 @@ def ana_klavye():
     )
     kb.add(
         types.KeyboardButton("Saglik Kontrol"),
+        types.KeyboardButton("Istatistik"),
+        types.KeyboardButton("Tum Pozisyon Kapat"),
     )
     return kb
 
@@ -322,104 +336,106 @@ def ana_klavye():
 @t_bot.message_handler(commands=['start'])
 @t_bot.message_handler(func=lambda m: m.text == "Baslat")
 def cmd_start(message):
-    global bot_aktif_mi
+    global bot_active
     with state_lock:
-        bot_aktif_mi = True
-    telegram_mesaj_gonder(
+        bot_active = True
+    send_telegram(
         "Bot aktif. Tarama ve islem dongusu calisiyor.\n"
         "/yardim — tum komutlar",
-        reply_markup=ana_klavye()
+        reply_markup=main_keyboard()
     )
 
 # ── /dur ──────────────────────────────────────────────────────────────────────
 @t_bot.message_handler(commands=['dur'])
 @t_bot.message_handler(func=lambda m: m.text == "Durdur")
-def cmd_dur(message):
-    global bot_aktif_mi
+def cmd_stop(message):
+    global bot_active
     with state_lock:
-        bot_aktif_mi = False
-    telegram_mesaj_gonder(
-        "Bot duraklatildi.\n"
-        "Acik pozisyon (varsa) korunuyor.\n"
+        bot_active = False
+    send_telegram(
+        "Bot duraklatildi. Acik pozisyonlar korunuyor.\n"
         "Devam icin /start",
-        reply_markup=ana_klavye()
+        reply_markup=main_keyboard()
     )
 
 # ── /durum ────────────────────────────────────────────────────────────────────
 @t_bot.message_handler(commands=['durum'])
 @t_bot.message_handler(func=lambda m: m.text == "Durum")
-def cmd_durum(message):
+def cmd_status(message):
     with state_lock:
-        _in_pos  = in_position
-        _side    = active_side
-        _sembol  = active_sembol
-        _entry   = entry_price
-        _sl      = stop_loss
-        _miktar  = active_miktar
-        _be      = breakeven_reached
-        _aktif   = bot_aktif_mi
-        _bans    = {k: v for k, v in sembol_ban_bitis.items()
+        _positions  = dict(active_positions)
+        _active   = bot_active
+        _bans    = {k: v for k, v in symbol_ban_until.items()
                     if v > datetime.now()}
+        _cooldown = loss_cooldown_until
 
-    fiyat     = son_fiyat_al(_sembol) if _sembol else 0.0
     bal       = get_balance()
-    durum_str = "AKTIF" if _aktif else "DURDURULDU"
+    status_str = "AKTIF" if _active else "DURDURULDU"
 
-    if _in_pos and fiyat > 0:
-        raw_pct = (
-            (fiyat - _entry) / _entry if _side == 'AL'
-            else (_entry - fiyat) / _entry
-        )
-        lev_pct = raw_pct * CONFIG['LEVERAGE'] * 100
-        pnl_usd = (
-            _miktar * (fiyat - _entry) if _side == 'AL'
-            else _miktar * (_entry - fiyat)
-        )
-        be_str  = "Evet" if _be else "Hayir"
-        poz_str = (
-            f"\nAcik Pozisyon: {_side} — {_sembol}\n"
-            f"  Giris     : {_entry:.4f}\n"
-            f"  Su an     : {fiyat:.4f}\n"
-            f"  Stop Loss : {_sl:.4f}\n"
-            f"  Breakeven : {be_str}\n"
-            f"  ROI       : %{lev_pct:.2f} ({pnl_usd:+.2f} USDT)\n"
-            f"  TP hedef  : %{tp_orani_hesapla()*CONFIG['LEVERAGE']*100:.1f} ROI "
-            f"({_entry*(1+tp_orani_hesapla()) if _side=='AL' else _entry*(1-tp_orani_hesapla()):.4f})"
-        )
-    else:
-        poz_str = "\nAcik Pozisyon: YOK"
-
-    # Show active bans [New F]
-    ban_str = ""
-    if _bans:
-        ban_str = "\n\n<b>Gecici Banli Semboller:</b>\n"
-        for sym, bitis in _bans.items():
-            kalan = int((bitis - datetime.now()).seconds / 60)
-            ban_str += f"  {sym} — {kalan}dk kaldi\n"
-
-    telegram_mesaj_gonder(
-        f"<b>Bot Durum Raporu — v3.7</b>\n"
-        f"Durum   : {durum_str}\n"
-        f"Kaldirac: {CONFIG['LEVERAGE']}x\n"
-        f"Aktif s.: {_sembol if _sembol else '-'}\n"
-        f"Bakiye  : <b>{bal:.2f} USDT</b>"
-        f"{poz_str}{ban_str}"
+    mesaj = (
+        f"<b>Bot Durum Raporu — v3.9</b>\n"
+        f"Durum   : {status_str}\n"
+        f"Bakiye  : <b>{bal:.2f} USDT</b>\n"
+        f"Pozisyon: {len(_positions)}/{CONFIG['MAX_CONCURRENT_POSITIONS']}\n"
     )
 
-# ── /bakiye ───────────────────────────────────────────────────────────────────
-@t_bot.message_handler(commands=['bakiye'])
+    if _cooldown and datetime.now() < _cooldown:
+        remaining = int((_cooldown - datetime.now()).seconds / 60)
+        mesaj += f"Cooldown: {remaining}dk kaldi\n"
+
+    if not _positions:
+        mesaj += "\nAcik Pozisyon: YOK\n"
+    else:
+        mesaj += "\n<b>— Acik Pozisyonlar —</b>\n"
+        for sym, pos in _positions.items():
+            fiyat_son = get_price(sym)
+            if fiyat_son > 0:
+                raw = ((fiyat_son - pos['entry_price']) / pos['entry_price']
+                       if pos['side'] == 'LONG'
+                       else (pos['entry_price'] - fiyat_son) / pos['entry_price'])
+                roi = raw * pos['leverage'] * 100
+                pnl = (pos['qty'] * (fiyat_son - pos['entry_price'])
+                       if pos['side'] == 'LONG'
+                       else pos['qty'] * (pos['entry_price'] - fiyat_son))
+                sure = int((datetime.now() - pos['open_time']).seconds / 60)
+                kalan_sure = int(CONFIG['MAX_POSITION_HOURS'] * 60 - sure)
+                kisi_str   = " [KISMI TP YAPILDI]" if pos['partial_tp_done'] else ""
+                mesaj += (
+                    f"\n{sym} {pos['side']} {pos['leverage']}x{kisi_str}\n"
+                    f"  Giris: {pos['entry_price']:.4f} | Su an: {fiyat_son:.4f}\n"
+                    f"  SL  : {pos['stop_loss']:.4f}\n"
+                    f"  ROI : <b>%{roi:.2f}</b> ({pnl:+.2f} USDT)\n"
+                    f"  Sure: {sure}dk (max {CONFIG['MAX_POSITION_HOURS']*60}dk, "
+                    f"{kalan_sure}dk kaldi)\n"
+                )
+
+    if _bans:
+        mesaj += "\n<b>— Gecici Banlar —</b>\n"
+        for sym, expiry in _bans.items():
+            remaining = int((expiry - datetime.now()).seconds / 60)
+            mesaj += f"  {sym}: {remaining}dk\n"
+
+    with state_lock:
+        _start_bal = start_balance
+    profit = bal - _start_bal
+    pct    = (profit / _start_bal * 100) if _start_bal > 0 else 0
+    mesaj += f"\nNet P/L : <b>{profit:+.2f} USDT (%{pct:+.2f})</b>"
+    send_telegram(mesaj)
+
+# ── /balance ───────────────────────────────────────────────────────────────────
+@t_bot.message_handler(commands=['balance'])
 @t_bot.message_handler(func=lambda m: m.text == "Bakiye")
-def cmd_bakiye(message):
+def cmd_balance(message):
     bal = get_balance()
     with state_lock:
-        _bas = baslangic_bakiye
-    kazanc = bal - _bas
-    pct    = (kazanc / _bas * 100) if _bas > 0 else 0
-    telegram_mesaj_gonder(
+        _start_bal = start_balance
+    profit = bal - _start_bal
+    pct    = (profit / _start_bal * 100) if _start_bal > 0 else 0
+    send_telegram(
         f"<b>Cuzdan Durumu</b>\n"
         f"Mevcut    : <b>{bal:.2f} USDT</b>\n"
-        f"Baslangic : {_bas:.2f} USDT\n"
-        f"Net       : <b>{kazanc:+.2f} USDT (%{pct:+.2f})</b>"
+        f"Baslangic : {_start_bal:.2f} USDT\n"
+        f"Net       : <b>{profit:+.2f} USDT (%{pct:+.2f})</b>"
     )
 
 # ── /pnl ──────────────────────────────────────────────────────────────────────
@@ -428,823 +444,591 @@ def cmd_bakiye(message):
 def cmd_pnl(message):
     try:
         if not os.path.isfile(CONFIG['LOG_FILE']):
-            telegram_mesaj_gonder("Henuz tamamlanmis islem yok.")
+            send_telegram("Henuz tamamlanmis islem yok.")
             return
-        df = pd.read_csv(
-            CONFIG['LOG_FILE'], delimiter=';',
-            on_bad_lines='skip', engine='python'
-        )
-        df['Zaman'] = pd.to_datetime(df['Zaman'])
-        kapandi = df[df['Durum'] == 'KAPANDI'].copy()
-        kapandi['PnL_USD_net'] = pd.to_numeric(
-            kapandi['PnL_USD_net'], errors='coerce'
-        )
-        bugun = kapandi[
-            kapandi['Zaman'] > datetime.now().replace(
-                hour=0, minute=0, second=0)
-        ]
-        hafta = kapandi[
-            kapandi['Zaman'] > (datetime.now() - timedelta(days=7))
-        ]
+        df = pd.read_csv(CONFIG['LOG_FILE'], delimiter=';',
+                         on_bad_lines='skip', engine='python')
+        df['Time'] = pd.to_datetime(df['Time'])
+        closed_trades = df[df['Status'] == 'CLOSED'].copy()
+        closed_trades['PnL_USD_net'] = pd.to_numeric(
+            closed_trades['PnL_USD_net'], errors='coerce')
+        today = closed_trades[closed_trades['Time'] > datetime.now().replace(
+            hour=0, minute=0, second=0)]
+        week = closed_trades[closed_trades['Time'] >
+                        (datetime.now() - timedelta(days=7))]
 
-        def ozet(sub):
-            if sub.empty:
-                return "Islem yok"
-            pnl = sub['PnL_USD_net'].sum()
-            cnt = len(sub)
-            kaz = len(sub[sub['PnL_USD_net'] > 0])
-            ort = sub['PnL_USD_net'].mean()
-            wr  = kaz / cnt * 100 if cnt > 0 else 0
-            return (
-                f"<b>{pnl:+.2f} USDT</b> | "
-                f"{cnt} islem | Win: %{wr:.0f} | Ort: {ort:+.2f}"
-            )
+        def summary(subset):
+            if subset.empty: return "Islem yok"
+            pnl = subset['PnL_USD_net'].sum()
+            cnt = len(subset)
+            wins = len(subset[subset['PnL_USD_net'] > 0])
+            avg = subset['PnL_USD_net'].mean()
+            wr  = wins / cnt * 100 if cnt > 0 else 0
+            return (f"<b>{pnl:+.2f} USDT</b> | {cnt} islem | "
+                    f"Win: %{wr:.0f} | Ort: {avg:+.2f}")
 
-        sembol_ozet = ""
-        if not kapandi.empty and 'Sembol' in kapandi.columns:
-            for sym, grp in kapandi.groupby('Sembol'):
-                sym_pnl = grp['PnL_USD_net'].sum()
-                sembol_ozet += (
-                    f"  {sym}: {sym_pnl:+.2f} USDT "
-                    f"({len(grp)} islem)\n"
-                )
+        symbol_summary = ""
+        if not closed_trades.empty and 'Symbol' in closed_trades.columns:
+            for sym, grp in closed_trades.groupby('Symbol'):
+                sp = grp['PnL_USD_net'].sum()
+                symbol_summary += (f"  {sym}: {sp:+.2f} USDT "
+                                f"({len(grp)} islem)\n")
 
-        telegram_mesaj_gonder(
-            f"<b>PnL Ozeti (Ucret Dahil)</b>\n"
-            f"Bugun : {ozet(bugun)}\n"
-            f"7 Gun : {ozet(hafta)}\n"
-            f"Tumu  : {ozet(kapandi)}\n"
-            f"<b>Sembole Gore:</b>\n{sembol_ozet}"
+        send_telegram(
+            f"<b>PnL Ozeti</b>\n"
+            f"Bugun : {summary(today)}\n"
+            f"7 Gun : {summary(week)}\n"
+            f"Tumu  : {summary(closed_trades)}\n"
+            f"<b>Sembole Gore:</b>\n{symbol_summary}"
         )
     except Exception as e:
-        telegram_mesaj_gonder(f"PnL hatasi: {e}")
+        send_telegram(f"PnL hatasi: {e}")
+
+# ── /istatistik [v3.9] ────────────────────────────────────────────────────────
+@t_bot.message_handler(commands=['istatistik'])
+@t_bot.message_handler(func=lambda m: m.text == "Istatistik")
+def cmd_istatistik(message):
+    try:
+        if not os.path.isfile(CONFIG['LOG_FILE']):
+            send_telegram("Henuz kayitli islem yok.")
+            return
+        df = pd.read_csv(CONFIG['LOG_FILE'], delimiter=';',
+                         on_bad_lines='skip', engine='python')
+        df['Time'] = pd.to_datetime(df['Time'])
+        closed_trades = df[df['Status'] == 'CLOSED'].copy()
+        if closed_trades.empty:
+            send_telegram("Tamamlanmis islem bulunamadi.")
+            return
+        closed_trades['PnL_USD_net'] = pd.to_numeric(
+            closed_trades['PnL_USD_net'], errors='coerce')
+        closed_trades['Hour'] = closed_trades['Time'].dt.hour
+
+        mesaj = "<b>Detayli Istatistik — v3.9</b>\n"
+
+        # By direction
+        mesaj += "\n<b>— Yone Gore —</b>\n"
+        for yon in ['LONG', 'SHORT']:
+            subset = closed_trades[closed_trades['Side'] == yon]
+            if subset.empty:
+                mesaj += f"{yon}: Islem yok\n"
+                continue
+            pnl = subset['PnL_USD_net'].sum()
+            wr  = len(subset[subset['PnL_USD_net'] > 0]) / len(subset) * 100
+            mesaj += (f"{yon}: {len(subset)} islem | "
+                      f"Win %{wr:.0f} | {pnl:+.2f} USDT\n")
+
+        # By symbol (top 8)
+        mesaj += "\n<b>— Sembole Gore (en iyi 8) —</b>\n"
+        sym_stats = []
+        for sym, grp in closed_trades.groupby('Symbol'):
+            pnl = grp['PnL_USD_net'].sum()
+            wr  = len(grp[grp['PnL_USD_net'] > 0]) / len(grp) * 100
+            sym_stats.append((sym, pnl, wr, len(grp)))
+        sym_stats.sort(key=lambda x: x[1], reverse=True)
+        for sym, pnl, wr, cnt in sym_stats[:8]:
+            mesaj += f"  {sym}: {pnl:+.2f} ({cnt} islem, %{wr:.0f} win)\n"
+
+        # By hour of day
+        mesaj += "\n<b>— Saate Gore (en iyi 6) —</b>\n"
+        hour_stats = []
+        for hour, grp in closed_trades.groupby('Hour'):
+            pnl = grp['PnL_USD_net'].sum()
+            wr  = len(grp[grp['PnL_USD_net'] > 0]) / len(grp) * 100
+            hour_stats.append((hour, pnl, wr, len(grp)))
+        hour_stats.sort(key=lambda x: x[1], reverse=True)
+        for hour, pnl, wr, cnt in hour_stats[:6]:
+            mesaj += (f"  {hour:02d}:00 UTC: {pnl:+.2f} "
+                      f"({cnt} islem, %{wr:.0f} win)\n")
+
+        # Closing reasons
+        mesaj += "\n<b>— Kapanma Sebebi —</b>\n"
+        if 'Close_Reason' in closed_trades.columns:
+            for reason, grp in closed_trades.groupby('Close_Reason'):
+                pnl = grp['PnL_USD_net'].sum()
+                mesaj += f"  {reason}: {len(grp)} islem | {pnl:+.2f} USDT\n"
+
+        send_telegram(mesaj)
+    except Exception as e:
+        send_telegram(f"Istatistik hatasi: {e}")
 
 # ── /son ──────────────────────────────────────────────────────────────────────
 @t_bot.message_handler(commands=['son'])
 @t_bot.message_handler(func=lambda m: m.text == "Son Islemler")
-def cmd_son(message):
+def cmd_recent(message):
     try:
         if not os.path.isfile(CONFIG['LOG_FILE']):
-            telegram_mesaj_gonder("Kayitli islem yok.")
+            send_telegram("Kayitli islem yok.")
             return
-        df = pd.read_csv(
-            CONFIG['LOG_FILE'], delimiter=';',
-            on_bad_lines='skip', engine='python'
-        )
-        kapandi = df[df['Durum'] == 'KAPANDI'].tail(5)
-        if kapandi.empty:
-            telegram_mesaj_gonder("Tamamlanmis islem bulunamadi.")
+        df = pd.read_csv(CONFIG['LOG_FILE'], delimiter=';',
+                         on_bad_lines='skip', engine='python')
+        closed_trades = df[df['Status'] == 'CLOSED'].tail(5)
+        if closed_trades.empty:
+            send_telegram("Tamamlanmis islem bulunamadi.")
             return
         mesaj = "<b>Son 5 Kapali Islem</b>\n"
-        for _, row in kapandi.iloc[::-1].iterrows():
+        for _, row in closed_trades.iloc[::-1].iterrows():
             try:
                 pnl_net = float(row['PnL_USD_net'])
-                pnl_pct = float(row['PnL_Yuzde_lev'])
-                sebep   = row.get('Kapanma_Sebebi', '?')
+                pnl_pct = float(row['PnL_Pct_lev'])
+                reason   = row.get('Close_Reason', '?')
             except Exception:
-                pnl_net, pnl_pct, sebep = 0, 0, "?"
+                pnl_net, pnl_pct, reason = 0, 0, "?"
             mesaj += (
-                f"{row.get('Sembol','?')} {row.get('Yon','?')} "
-                f"[{sebep}] {str(row.get('Zaman',''))[:16]}\n"
+                f"{row.get('Symbol','?')} {row.get('Side','?')} "
+                f"[{reason}] {str(row.get('Time',''))[:16]}\n"
                 f"  PnL: <b>{pnl_net:+.2f} USDT (%{pnl_pct:.2f})</b>\n"
             )
-        telegram_mesaj_gonder(mesaj)
+        send_telegram(mesaj)
     except Exception as e:
-        telegram_mesaj_gonder(f"Son islem hatasi: {e}")
+        send_telegram(f"Son islem hatasi: {e}")
 
 # ── /tara ─────────────────────────────────────────────────────────────────────
 @t_bot.message_handler(commands=['tara'])
 @t_bot.message_handler(func=lambda m: m.text == "Tarama")
-def cmd_tara(message):
+def cmd_scan(message):
     with state_lock:
-        cache = list(son_tarama_sonuclari)
-        bans  = {k: v for k, v in sembol_ban_bitis.items()
+        cache = list(last_scan_results)
+        bans  = {k: v for k, v in symbol_ban_until.items()
                  if v > datetime.now()}
-
     if cache:
-        _gonder_tarama_mesaji(cache, bans,
-                              baslik="Onceki Tarama (yenileniyor...)")
+        _send_scan_message(cache, bans, "Onceki Tarama (yenileniyor...)")
     else:
-        telegram_mesaj_gonder("Tarama baslatiliyor, lutfen bekleyin...")
+        send_telegram("Tarama baslatiliyor...")
+    threading.Thread(target=_scan_thread, daemon=True).start()
 
-    threading.Thread(target=_tara_thread, daemon=True).start()
-
-def _gonder_tarama_mesaji(sonuclar, bans=None, baslik="Tarama Sonuclari"):
-    bans = bans or {}
+def _send_scan_message(sonuclar, bans=None, baslik="Tarama Sonuclari"):
+    bans  = bans or {}
     mesaj = f"<b>{baslik}</b>\n"
     for r in sonuclar:
         ban_tag = ""
-        if r['sembol'] in bans:
-            kalan  = int((bans[r['sembol']] - datetime.now()).seconds / 60)
-            ban_tag = f" [BAN {kalan}dk]"
+        if r['symbol'] in bans:
+            remaining   = int((bans[r['symbol']] - datetime.now()).seconds / 60)
+            ban_tag = f" [BAN {remaining}dk]"
         mesaj += (
-            f"{r['sembol']}{ban_tag}  "
-            f"Skor:<b>{r['skor']:.2f}</b>  {r['sinyal']}\n"
-            f"  ADX:{r['adx']:.1f} RSI:{r['rsi']:.1f} "
-            f"StochK:{r['stoch_k']*100:.0f} "
-            f"MACD:{r['macd_dir']} "
-            f"OBV:{r['obv_trend']}\n"
+            f"{r['symbol']}{ban_tag}  Skor:<b>{r['score']:.2f}</b>  {r['signal']}\n"
+            f"  ADX:{r['adx']:.1f} StochK:{r['stoch_k']*100:.0f}% "
+            f"MACD:{r['macd_dir']} OBV:{r['obv_trend']}\n"
         )
-    mesaj += f"\nGuncellendi: {datetime.now().strftime('%H:%M:%S')}"
-    telegram_mesaj_gonder(mesaj)
+    mesaj += f"\n{datetime.now().strftime('%H:%M:%S')}"
+    send_telegram(mesaj)
 
-def _tara_thread():
-    global son_tarama_sonuclari
+def _scan_thread():
+    global last_scan_results
     try:
-        btc_trend = btc_trend_al()
-        sonuclar  = sembol_tara(btc_trend)
+        btc_trend = get_btc_trend()
+        sonuclar  = scan_symbols(btc_trend)
         with state_lock:
-            son_tarama_sonuclari = sonuclar
-            bans = {k: v for k, v in sembol_ban_bitis.items()
+            last_scan_results = sonuclar
+            bans = {k: v for k, v in symbol_ban_until.items()
                     if v > datetime.now()}
-        _gonder_tarama_mesaji(
-            sonuclar, bans,
-            baslik="Guncel Tarama Sonuclari"
-        )
+        _send_scan_message(sonuclar, bans, "Guncel Tarama Sonuclari")
     except Exception as e:
         print(f"[Tarama Thread] {e}")
 
-# ── /piyasa — shows all 7 indicator values [New G] ───────────────────────────
+# ── /piyasa ───────────────────────────────────────────────────────────────────
 @t_bot.message_handler(commands=['piyasa'])
 @t_bot.message_handler(func=lambda m: m.text == "Piyasa")
-def cmd_piyasa(message):
+def cmd_market(message):
     with state_lock:
-        _in_pos = in_position
-        _sembol = active_sembol
-        _cache  = list(son_tarama_sonuclari)
+        _positions = dict(active_positions)
+        _cache  = list(last_scan_results)
 
-    if _in_pos and _sembol:
-        hedef     = _sembol
-        baslik_ek = "(aktif pozisyon)"
+    if _positions:
+        target     = list(_positions.keys())[0]
+        title_suffix = f"(acik pozisyon: {target})"
     else:
-        en_iyi = next(
-            (r for r in _cache if r['sinyal'] != 'BEKLE'), None
-        )
-        if en_iyi:
-            hedef     = en_iyi['sembol']
-            baslik_ek = f"(en yuksek skor: {en_iyi['skor']:.2f})"
+        best = next((r for r in _cache if r['signal'] != 'WAIT'), None)
+        if best:
+            target     = best['symbol']
+            title_suffix = f"(en yuksek score: {best['score']:.2f})"
         else:
-            hedef     = CONFIG['SEMBOL_LISTESI'][0]
-            baslik_ek = "(varsayilan, sinyal yok)"
+            target     = CONFIG['SYMBOL_LIST'][0]
+            title_suffix = "(varsayilan)"
 
-    telegram_mesaj_gonder(f"{hedef} analizi cekiliyor {baslik_ek}...")
+    send_telegram(f"{target} analizi cekiliyor {title_suffix}...")
     try:
-        r = sembol_analiz_et(hedef)
+        r = analyze_symbol(target)
         if not r:
-            telegram_mesaj_gonder("Analiz basarisiz.")
+            send_telegram("Analiz basarisiz.")
             return
         def eb(v): return "EVET" if v else "HAYIR"
-        mum_str  = "YUKARI (yesil)" if r['mum_yukari'] else "ASAGI (kirmizi)"
-        _tp_oran = tp_orani_hesapla()
-        _tp_al   = r['fiyat'] * (1 + _tp_oran)
-        _tp_sat  = r['fiyat'] * (1 - _tp_oran)
-        _sl_al   = r['fiyat'] - r['atr'] * CONFIG['ATR_SL_CARPAN']
-        _sl_sat  = r['fiyat'] + r['atr'] * CONFIG['ATR_SL_CARPAN']
-        if CONFIG['TP_ROI_MOD']:
-            tp_label = (f"ROI hedef %{CONFIG['TP_ROI_HEDEF']*100:.0f} → "
-                        f"AL:{_tp_al:.4f}  SAT:{_tp_sat:.4f}")
+        mum_str    = "YUKARI" if r['mum_yukari'] else "ASAGI"
+        lev        = calc_dynamic_leverage(r['adx'])
+        _tp_al     = r['price'] * (1 + calc_tp_rate('LONG', lev))
+        _tp_sat    = r['price'] * (1 - calc_tp_rate('SHORT', lev))
+        sl_al_c    = CONFIG['ATR_SL_MULT_LONG']
+        sl_sat_c   = CONFIG['ATR_SL_MULT_SHORT']
+        _sl_al     = r['price'] - r['atr'] * sl_al_c
+        _sl_sat    = r['price'] + r['atr'] * sl_sat_c
+        stoch_gate = (
+            "AL KAPI GECTI"  if r['stoch_k'] < CONFIG['STOCH_OVERSOLD']
+            else "SAT KAPI GECTI" if r['stoch_k'] > CONFIG['STOCH_OVERBOUGHT']
+            else f"KAPI GECMEDI"
+        )
+        if CONFIG['TP_ROI_MODE']:
+            tp_label = (
+                f"AL ROI %{CONFIG['TP_ROI_TARGET']*100:.0f} ({_tp_al:.4f}) | "
+                f"SAT ROI %{CONFIG['TP_ROI_TARGET_SHORT']*100:.0f} ({_tp_sat:.4f})"
+            )
         else:
-            tp_label = (f"Fiyat %{CONFIG['TP_ORANI']*100:.1f} → "
-                        f"AL:{_tp_al:.4f}  SAT:{_tp_sat:.4f}")
-        stoch_gate = ("AL KAPI GECTI" if r['stoch_k'] < CONFIG['STOCH_ASIRI_SATIS']
-                      else "SAT KAPI GECTI" if r['stoch_k'] > CONFIG['STOCH_ASIRI_ALIS']
-                      else f"KAPI GECMEDI (AL icin K&lt;{CONFIG['STOCH_ASIRI_SATIS']*100:.0f}%)")
-        telegram_mesaj_gonder(
-            f"<b>Detayli Analiz — {hedef}</b>\n"
-            f"Fiyat       : {r['fiyat']:.4f}\n"
+            tp_label = (
+                f"AL: {_tp_al:.4f} | SAT: {_tp_sat:.4f}"
+            )
+        send_telegram(
+            f"<b>Detayli Analiz — {target}</b>\n"
+            f"Fiyat       : {r['price']:.4f}\n"
             f"ATR         : {r['atr']:.4f} (%{r['atr_pct']*100:.2f})\n"
+            f"Kaldirac    : {lev}x (ADX bazli dinamik)\n"
             f"\n<b>— Gosterge Degerleri —</b>\n"
             f"ADX         : {r['adx']:.1f}\n"
-            f"RSI (5m)    : {r['rsi']:.1f} (skor katkilisi)\n"
             f"StochRSI K  : {r['stoch_k']*100:.1f}% → {stoch_gate}\n"
             f"StochRSI D  : {r['stoch_d']*100:.1f}%\n"
             f"MACD Hist.  : {r['macd_dir']} ({r['macd_hist']:+.6f})\n"
             f"EMA21 (5m)  : {r['ema21']:.4f} "
-            f"({'Fiyat Ustu' if r['fiyat'] > r['ema21'] else 'Fiyat Alti'})\n"
+            f"({'Ustu' if r['price'] > r['ema21'] else 'Alti'})\n"
             f"OBV Trend   : {r['obv_trend']}\n"
             f"Mum Yonu    : {mum_str}\n"
             f"\n<b>— Seviyeler —</b>\n"
             f"TP          : {tp_label}\n"
-            f"SL (ATR)    : AL:{_sl_al:.4f}  SAT:{_sl_sat:.4f}\n"
-            f"\n<b>— Filtreler —</b>\n"
+            f"SL AL       : {_sl_al:.4f} ({sl_al_c}×ATR)\n"
+            f"SL SAT      : {_sl_sat:.4f} ({sl_sat_c}×ATR)\n"
+            f"\n<b>— Filtreler (score katkilisi) —</b>\n"
             f"Bias (15m)  : {r['bias']}\n"
             f"BTC Trendi  : {r['btc_trend']}\n"
             f"Funding     : {r['funding']*100:.4f}%\n"
             f"Vol Oran    : {r['vol_oran']:.2f}x\n"
-            f"Hacim onay  : {eb(r['hacim_ok'])}\n"
+            f"Hacim onay  : {eb(r['volume_ok'])}\n"
             f"Volatilite  : {eb(r['vol_ok'])}\n"
-            f"Seans       : {eb(r['session_ok'])}\n"
-            f"\n<b>Sinyal Skoru : {r['skor']:.3f}</b>\n"
-            f"<b>Sinyal       : {r['sinyal']}</b>"
+            f"\n<b>Sinyal Skoru : {r['score']:.3f}</b>\n"
+            f"<b>Sinyal       : {r['signal']}</b>"
         )
     except Exception as e:
-        telegram_mesaj_gonder(f"Piyasa analiz hatasi: {e}")
+        send_telegram(f"Piyasa analiz hatasi: {e}")
 
 # ── /backtest ─────────────────────────────────────────────────────────────────
 @t_bot.message_handler(commands=['backtest'])
 @t_bot.message_handler(func=lambda m: m.text == "Backtest")
 def cmd_backtest(message):
-    telegram_mesaj_gonder(
-        f"Backtest baslatildi...\n"
-        f"Tum semboller ({len(CONFIG['SEMBOL_LISTESI'])} adet), "
+    send_telegram(
+        f"Backtest baslatildi — {len(CONFIG['SYMBOL_LIST'])} symbol, "
         f"300 mum. Bekleyin."
     )
     threading.Thread(target=_backtest_thread, daemon=True).start()
 
 def _backtest_thread():
-    for sembol in CONFIG['SEMBOL_LISTESI']:
+    for symbol in CONFIG['SYMBOL_LIST']:
         try:
-            sonuc = backtest_calistir(sembol, CONFIG['ENTRY_TF'], limit=300)
-            telegram_mesaj_gonder(sonuc)
+            sonuc = run_backtest(symbol, CONFIG['ENTRY_TF'], limit=300)
+            send_telegram(sonuc)
             time.sleep(3)
         except Exception as e:
-            telegram_mesaj_gonder(f"Backtest hatasi ({sembol}): {e}")
+            send_telegram(f"Backtest hatasi ({symbol}): {e}")
+
+# ── /kapat — Close specific or all positions [v3.9] ──────────────────────────
+@t_bot.message_handler(commands=['kapat'])
+@t_bot.message_handler(func=lambda m: m.text == "Tum Pozisyon Kapat")
+def cmd_close(message):
+    with state_lock:
+        _positions = dict(active_positions)
+
+    if not _positions:
+        send_telegram("Kapatilacak acik pozisyon yok.")
+        return
+
+    # Check if specific symbol given: /kapat HYPE/USDT
+    target_symbol = None
+    if message.text and message.text.startswith('/kapat '):
+        parts = message.text.split(' ', 1)
+        if len(parts) > 1:
+            target_symbol = parts[1].strip().upper()
+            if '/' not in target_symbol:
+                target_symbol += '/USDT'
+            if target_symbol not in _positions:
+                send_telegram(
+                    f"{target_symbol} icin acik pozisyon bulunamadi.\n"
+                    f"Acik: {', '.join(_positions.keys())}"
+                )
+                return
+
+    to_close = ([target_symbol] if target_symbol
+                      else list(_positions.keys()))
+    send_telegram(
+        f"ACIL KAPAT: {', '.join(to_close)}\n"
+        f"Islemler gerceklestiriliyor..."
+    )
+    threading.Thread(
+        target=_close_thread,
+        args=(to_close,),
+        daemon=True
+    ).start()
+
+def _close_thread(semboller):
+    for symbol in semboller:
+        with state_lock:
+            pos = active_positions.get(symbol)
+        if not pos:
+            continue
+        try:
+            if CONFIG['BRACKET_ORDERS']:
+                cancel_bracket_orders(symbol, pos)
+
+            try:
+                pos_check = api_call(exchange.fetch_positions, [symbol])
+                still_open = any(
+                    float(p.get('contracts', 0) or 0) > 0
+                    for p in pos_check
+                )
+            except Exception:
+                still_open = True
+
+            if still_open:
+                exit_side = 'sell' if pos['side'] == 'LONG' else 'buy'
+                api_call(
+                    exchange.create_market_order,
+                    symbol, exit_side, pos['qty'],
+                    params={'reduceOnly': True}
+                )
+
+            fiyat_son = get_price(symbol)
+            if fiyat_son > 0:
+                raw = ((fiyat_son - pos['entry_price']) / pos['entry_price']
+                       if pos['side'] == 'LONG'
+                       else (pos['entry_price'] - fiyat_son) / pos['entry_price'])
+                roi = raw * pos['leverage'] * 100
+                pnl = (pos['qty'] * (fiyat_son - pos['entry_price'])
+                       if pos['side'] == 'LONG'
+                       else pos['qty'] * (pos['entry_price'] - fiyat_son))
+                send_telegram(
+                    f"<b>POZISYON KAPANDI — MANUEL</b>\n"
+                    f"Sembol : <b>{symbol}</b> | {pos['side']}\n"
+                    f"Giris  : {pos['entry_price']:.4f}\n"
+                    f"Cikis  : {fiyat_son:.4f}\n"
+                    f"ROI    : <b>%{roi:.2f}</b> ({pnl:+.2f} USDT)"
+                )
+
+            with state_lock:
+                active_positions.pop(symbol, None)
+
+        except Exception as e:
+            send_telegram(
+                f"KAPAT HATASI — {symbol}\n"
+                f"Hata: {str(e)[:100]}\n"
+                f"Binance'den manuel kapatin!"
+            )
 
 # ── /saglik ───────────────────────────────────────────────────────────────────
 @t_bot.message_handler(commands=['saglik'])
 @t_bot.message_handler(func=lambda m: m.text == "Saglik Kontrol")
-def cmd_saglik(message):
-    telegram_mesaj_gonder(
-        "Sistem kontrol ediliyor, lutfen bekleyin (~15 saniye)..."
-    )
-    threading.Thread(target=_saglik_thread, daemon=True).start()
+def cmd_health(message):
+    send_telegram("Sistem kontrol ediliyor (~20 saniye)...")
+    threading.Thread(target=_health_thread, daemon=True).start()
 
-def _saglik_thread():
-    satirlar     = []
-    hata_sayisi  = 0
-    uyari_sayisi = 0
+def _health_thread():
+    lines    = []
+    error_count = 0
+    warn_count = 0
 
-    def ok(etiket, deger=""):
-        satirlar.append("OK    " + etiket + (f": {deger}" if deger else ""))
+    def ok(et, dg=""):
+        lines.append("OK    " + et + (f": {dg}" if dg else ""))
+    def hata(et, dg=""):
+        nonlocal error_count; error_count += 1
+        lines.append("HATA  " + et + (f": {dg}" if dg else ""))
+    def uyari(et, dg=""):
+        nonlocal warn_count; warn_count += 1
+        lines.append("UYARI " + et + (f": {dg}" if dg else ""))
+    def section(b):
+        lines.append(""); lines.append(f"[ {b} ]")
 
-    def hata(etiket, deger=""):
-        nonlocal hata_sayisi
-        hata_sayisi += 1
-        satirlar.append("HATA  " + etiket + (f": {deger}" if deger else ""))
+    lines.append("=== SAGLIK RAPORU — v3.9 ===")
+    lines.append(f"Zaman: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    def uyari(etiket, deger=""):
-        nonlocal uyari_sayisi
-        uyari_sayisi += 1
-        satirlar.append("UYARI " + etiket + (f": {deger}" if deger else ""))
-
-    def bolum(baslik):
-        satirlar.append("")
-        satirlar.append(f"[ {baslik} ]")
-
-    satirlar.append("=== SISTEM SAGLIK RAPORU ===")
-    satirlar.append(f"Zaman: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-    bolum("API BAGLANTISI")
+    section("API")
     try:
         t0 = time.time()
         exchange.fetch_time()
         ms = int((time.time() - t0) * 1000)
-        if ms < 500: ok("API baglantisi", f"{ms}ms")
-        else:        uyari("API yavas", f"{ms}ms")
+        (ok if ms < 500 else uyari)("API", f"{ms}ms")
     except Exception as e:
-        hata("API baglantisi", str(e)[:60])
+        hata("API", str(e)[:60])
 
-    bolum("BAKIYE")
+    section("BAKIYE")
     try:
-        t0  = time.time()
         bal = get_balance()
-        ms  = int((time.time() - t0) * 1000)
-        if bal > 0: ok("Bakiye okundu", f"{bal:.2f} USDT ({ms}ms)")
-        else:       uyari("Bakiye sifir", "Demo hesap bos olabilir")
+        (ok if bal > 0 else uyari)("Bakiye", f"{bal:.2f} USDT")
     except Exception as e:
-        hata("Bakiye okunamadi", str(e)[:60])
+        hata("Bakiye", str(e)[:60])
 
-    bolum("PIYASA VERISI + INDIKTORLER")
-    test_sembol = CONFIG['SEMBOL_LISTESI'][0]
-    try:
-        t0   = time.time()
-        r    = sembol_analiz_et(test_sembol, bypass_session=True)
-        ms   = int((time.time() - t0) * 1000)
-        if r:
-            ok("ADX",      f"{r['adx']:.1f}")
-            ok("RSI",      f"{r['rsi']:.1f} (skor katkilisi, kapi degil)")
-            stk = r['stoch_k'] * 100
-            std = r['stoch_d'] * 100
-            stoch_durum = "ASIRI SATIS" if r['stoch_k'] < CONFIG['STOCH_ASIRI_SATIS']                           else "ASIRI ALIS" if r['stoch_k'] > CONFIG['STOCH_ASIRI_ALIS']                           else "NOTR"
-            ok("StochRSI K/D", f"K:{stk:.1f}% D:{std:.1f}% → {stoch_durum}")
-            ok("Stoch AL esik", f"K &lt; {CONFIG['STOCH_ASIRI_SATIS']*100:.0f}%  "
-                                f"(simdi: {'GECTI' if r['stoch_k'] < CONFIG['STOCH_ASIRI_SATIS'] else 'GECMEDI'})")
-            ok("Stoch SAT esik", f"K &gt; {CONFIG['STOCH_ASIRI_ALIS']*100:.0f}%  "
-                                 f"(simdi: {'GECTI' if r['stoch_k'] > CONFIG['STOCH_ASIRI_ALIS'] else 'GECMEDI'})")
-            ok("MACD",     f"{r['macd_dir']} ({ms}ms)")
-            ok("EMA21",    f"{r['ema21']:.4f} "
-                           f"({'Fiyat ustu' if r['fiyat'] > r['ema21'] else 'Fiyat alti'})")
-            ok("OBV",      r['obv_trend'])
-            ok("Mum yonu", "YUKARI" if r['mum_yukari'] else "ASAGI")
-            ok("Sinyal",   f"{r['sinyal']} skor:{r['skor']:.3f}")
-            if r['adx'] < 10:
-                uyari("ADX cok dusuk", "Trend yok")
-        else:
-            hata("Indiktor hesabi", "None dondu")
-    except Exception as e:
-        hata("Indiktor/Piyasa", str(e)[:60])
-
-    # TP modu raporu
-    bolum("TP MODU")
-    if CONFIG['TP_ROI_MOD']:
-        hedef_roi = CONFIG['TP_ROI_HEDEF'] * 100
-        fiyat_hareketi = tp_orani_hesapla() * 100
-        ok("TP Modu", f"ROI bazli (onerilen)")
-        ok("ROI hedefi", f"%{hedef_roi:.1f} margin uzerinden")
-        ok("Gerekli fiyat hareketi", f"%{fiyat_hareketi:.2f} "
-                                     f"({CONFIG['LEVERAGE']}x kaldirac ile)")
-    else:
-        ok("TP Modu", "Fiyat hareketi bazli")
-        ok("TP orani", f"%{CONFIG['TP_ORANI']*100:.1f} fiyat hareketi "
-                       f"= %{CONFIG['TP_ORANI']*CONFIG['LEVERAGE']*100:.1f} ROI")
-
-    bolum("BTC TREND FILTRESI")
+    section("INDIKTORLER (ilk symbol)")
+    test_sym = CONFIG['SYMBOL_LIST'][0]
     try:
         t0 = time.time()
-        bt = btc_trend_al()
+        r  = analyze_symbol(test_sym)
         ms = int((time.time() - t0) * 1000)
-        ok("BTC 200 EMA", f"{bt} ({ms}ms)")
-    except Exception as e:
-        hata("BTC trend", str(e)[:60])
-
-    bolum("HTF BIAS")
-    try:
-        t0   = time.time()
-        bias = htf_bias_al(test_sembol)
-        ms   = int((time.time() - t0) * 1000)
-        ok(f"15m bias ({test_sembol})", f"{bias} ({ms}ms)")
-    except Exception as e:
-        hata("HTF bias", str(e)[:60])
-
-    bolum("FUNDING RATE")
-    try:
-        t0      = time.time()
-        funding = funding_rate_al(test_sembol)
-        ms      = int((time.time() - t0) * 1000)
-        f_pct   = funding * 100
-        if abs(funding) > CONFIG['MAX_FUNDING_RATE']:
-            uyari(f"Funding yuksek", f"%{f_pct:.4f}")
+        if r:
+            ok("ADX",       f"{r['adx']:.1f}")
+            ok("StochRSI",  f"K:{r['stoch_k']*100:.1f}% D:{r['stoch_d']*100:.1f}%")
+            stg = ("AL GECTI"  if r['stoch_k'] < CONFIG['STOCH_OVERSOLD']
+                   else "SAT GECTI" if r['stoch_k'] > CONFIG['STOCH_OVERBOUGHT']
+                   else "GECMEDI")
+            ok("Stoch kapi", stg)
+            ok("MACD",      f"{r['macd_dir']} ({ms}ms)")
+            ok("EMA21",     f"{r['ema21']:.4f}")
+            ok("OBV",       r['obv_trend'])
+            ok("Sinyal",    f"{r['signal']} score:{r['score']:.3f}")
         else:
-            ok(f"Funding ({test_sembol})", f"%{f_pct:.4f} ({ms}ms)")
+            hata("Indiktor", "None dondu")
     except Exception as e:
-        hata("Funding rate", str(e)[:60])
+        hata("Indiktor", str(e)[:60])
 
-    bolum("LOG DOSYASI")
-    try:
-        test_kayit = {
-            'Zaman':         datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'Sembol':        'TEST', 'Durum': 'SAGLIK_TEST',
-            'Yon':           '-',   'Hacim_USD': 0, 'Fiyat': 0,
-            'PnL_Yuzde_lev': '-',  'PnL_USD_brut': '-',
-            'Ucret_USD':     '-',  'PnL_USD_net': '-',
-            'Kapanma_Sebebi':'-',
-        }
-        log_trade(test_kayit, 0)
-        df = pd.read_csv(CONFIG['LOG_FILE'], delimiter=';',
-                         on_bad_lines='skip', engine='python')
-        ok("Log yazma", "Basarili")
-        ok("Log okuma", f"{len(df)} kayit")
-        df = df[df['Durum'] != 'SAGLIK_TEST']
-        df.to_csv(CONFIG['LOG_FILE'], sep=';', index=False,
-                  quoting=csv.QUOTE_ALL)
-        ok("Test satiri temizlendi", "")
-    except Exception as e:
-        hata("Log dosyasi", str(e)[:60])
-
-    bolum("DEVRE KESICI")
-    try:
-        if not os.path.isfile(CONFIG['LOG_FILE']):
-            ok("Log yok", "Yeni baslar")
-        else:
-            df = pd.read_csv(CONFIG['LOG_FILE'], delimiter=';',
-                             on_bad_lines='skip', engine='python')
-            df['Zaman'] = pd.to_datetime(df['Zaman'])
-            bugun = df[
-                (df['Zaman'] > datetime.now().replace(
-                    hour=0, minute=0, second=0)) &
-                (df['Durum'] == 'KAPANDI')
-            ]
-            if bugun.empty:
-                ok("Gunluk PnL", "Bugun islem yok")
-            else:
-                gnl  = pd.to_numeric(
-                    bugun['PnL_USD_net'], errors='coerce').sum()
-                bal  = get_balance()
-                ref  = bal + abs(gnl) if bal > 0 else 1
-                oran = abs(gnl) / ref * 100 if gnl < 0 else 0
-                esik = CONFIG['GUNLUK_MAX_ZARAR'] * 100
-                if oran >= esik:
-                    hata("Devre kesici AKTIF",
-                         f"Kayip %{oran:.1f} / limit %{esik:.0f}")
-                elif oran > esik * 0.7:
-                    uyari("Limite yaklasiliyor",
-                          f"%{oran:.1f} / limit %{esik:.0f}")
-                else:
-                    ok("Devre kesici normal",
-                       f"PnL: {gnl:+.2f} USDT")
-    except Exception as e:
-        hata("Devre kesici", str(e)[:60])
-
-    bolum("SEANS FILTRESI")
-    saat_utc = datetime.now(timezone.utc).hour
-    if not CONFIG['SESSION_FILTRE']:
-        ok("Seans filtresi", "Kapali — 24/7")
-    elif CONFIG['SESSION_BASLANGIC'] <= saat_utc < CONFIG['SESSION_BITIS']:
-        ok("Seans ACIK", f"{saat_utc}:xx UTC")
+    section("TP MODU")
+    lev = CONFIG['LEVERAGE']
+    if CONFIG['TP_ROI_MODE']:
+        ok("TP Modu", "ROI bazli")
+        ok("AL target",
+           f"ROI %{CONFIG['TP_ROI_TARGET']*100:.0f} "
+           f"→ %{calc_tp_rate('LONG',lev)*100:.2f} price hareketi")
+        ok("SAT target",
+           f"ROI %{CONFIG['TP_ROI_TARGET_SHORT']*100:.0f} "
+           f"→ %{calc_tp_rate('SHORT',lev)*100:.2f} price hareketi")
     else:
-        if saat_utc < CONFIG['SESSION_BASLANGIC']:
-            dk = (CONFIG['SESSION_BASLANGIC'] - saat_utc) * 60
-        else:
-            dk = (24 - saat_utc + CONFIG['SESSION_BASLANGIC']) * 60
-        uyari("Seans KAPALI", f"~{dk}dk sonra acilir")
+        ok("TP Modu", "Fiyat hareketi bazli")
+    if CONFIG['PARTIAL_TP_ACTIVE']:
+        ok("Kismi TP",
+           f"TP1 {CONFIG['PARTIAL_TP_PCT']*100:.0f}% kapat, "
+           f"TP2 ROI %{CONFIG['TP2_ROI_TARGET']*100:.0f}")
+    else:
+        uyari("Kismi TP", "Kapali")
+    ok("Dinamik leverage",
+       f"{'AKTIF' if CONFIG['DYNAMIC_LEVERAGE'] else 'KAPALI'} "
+       f"({lev}x baz, max {CONFIG['MAX_LEVERAGE']}x)")
 
-    bolum("POZISYON + BOT DURUMU")
+    section("BRACKET EMIRLER")
+    if CONFIG['BRACKET_ORDERS']:
+        ok("Bracket modu", "AKTIF — exchange SL+TP")
+    else:
+        uyari("Bracket modu", "KAPALI — yazilim SL/TP (risk yuksek)")
+
+    section("MULTI-POZISYON DURUMU")
     with state_lock:
-        _in_pos = in_position
-        _side   = active_side
-        _sembol = active_sembol
-        _entry  = entry_price
-        _sl     = stop_loss
-        _be     = breakeven_reached
-        _aktif  = bot_aktif_mi
-        _rapor  = son_rapor_zamani
-        _bans   = {k: v for k, v in sembol_ban_bitis.items()
+        _positions = dict(active_positions)
+        _bans   = {k: v for k, v in symbol_ban_until.items()
                    if v > datetime.now()}
-
-    with state_lock:
-        _sl_oid = aktif_sl_order_id
-        _tp_oid = aktif_tp_order_id
-        _ex_sl  = son_exchange_sl
-
-    if _in_pos:
-        f_now   = son_fiyat_al(_sembol)
-        raw_pnl = (
-            (f_now - _entry) / _entry if _side == 'AL'
-            else (_entry - f_now) / _entry
-        )
-        lev_pnl = raw_pnl * CONFIG['LEVERAGE'] * 100
-        ok("Acik pozisyon", f"{_sembol} {_side}")
-        ok("Giris / Simdi", f"{_entry:.4f} / {f_now:.4f}")
-        ok("Yazilim SL",    f"{_sl:.4f}")
-        if CONFIG['BRACKET_EMIR']:
-            if _sl_oid:
-                ok("Exchange SL (STOP_MARKET)",
-                   f"AKTIF id={_sl_oid} fiyat={_ex_sl:.4f}")
-            else:
-                uyari("Exchange SL", "Order ID yok — bracket yerlesirilemedi")
-            if _tp_oid:
-                ok("Exchange TP (TAKE_PROFIT_MARKET)", f"AKTIF id={_tp_oid}")
-            else:
-                uyari("Exchange TP", "Order ID yok — bracket yerlesirilemedi")
-        else:
-            uyari("Bracket emir", "KAPALI — yazilim SL/TP aktif (risk yuksek)")
-        if lev_pnl >= 0: ok("ROI", f"+%{lev_pnl:.2f}")
-        else:             uyari("ROI negatif", f"%{lev_pnl:.2f}")
-    else:
-        ok("Pozisyon yok", "Sinyal bekleniyor")
-        if CONFIG['BRACKET_EMIR']:
-            ok("Bracket emir modu", "AKTIF")
-        else:
-            uyari("Bracket emir modu", "KAPALI — canli islemde BRACKET_EMIR=True onerilir")
-
-    if _aktif: ok("Bot dongusu", "AKTIF")
-    else:      hata("Bot dongusu", "DURDURULDU")
-
-    gecen = (datetime.now() - _rapor).seconds
-    if gecen < CONFIG['HEARTBEAT_DAKIKA'] * 60 * 2:
-        ok("Son heartbeat", f"{gecen}sn once")
-    else:
-        uyari("Heartbeat gecikti", f"{gecen}sn")
-
+    ok("Max pozisyon", str(CONFIG['MAX_CONCURRENT_POSITIONS']))
+    ok("Acik pozisyon", str(len(_positions)))
+    ok("Max marjin", f"%{CONFIG['MAX_TOTAL_MARGIN_PCT']*100:.0f} balance")
+    ok("Max sure", f"{CONFIG['MAX_POSITION_HOURS']}h auto-close")
+    for sym, pos in _positions.items():
+        sure = int((datetime.now() - pos['open_time']).seconds / 60)
+        ok(f"  {sym}", f"{pos['side']} {pos['leverage']}x {sure}dk")
     if _bans:
-        uyari("Aktif banlar", f"{len(_bans)} sembol gecici banlandi")
-        for sym, bitis in _bans.items():
-            kalan = int((bitis - datetime.now()).seconds / 60)
-            uyari(f"  Ban: {sym}", f"{kalan}dk kaldi — "
-                  f"{CONFIG['MAX_AYNI_SEMBOL_KAYIP']} ardisik SL sonrasi")
+        for sym, expiry in _bans.items():
+            remaining = int((expiry - datetime.now()).seconds / 60)
+            uyari(f"Ban: {sym}", f"{remaining}dk")
     else:
-        ok("Sembol ban durumu", f"Banli sembol yok "
-                                f"(kural: {CONFIG['MAX_AYNI_SEMBOL_KAYIP']} ardisik SL → "
-                                f"{CONFIG['SEMBOL_BAN_DAKIKA']}dk ban)")
+        ok("Ban durumu", "Banli symbol yok")
 
-    bolum("IZLEME LISTESI")
-    ok("Sembol sayisi", str(len(CONFIG['SEMBOL_LISTESI'])))
-    for s in CONFIG['SEMBOL_LISTESI']:
-        if s in exchange.markets: ok(s, "Mevcut")
-        else:                     uyari(s, "Bulunamadi")
+    section("IZLEME LISTESI")
+    ok("Sembol sayisi", str(len(CONFIG['SYMBOL_LIST'])))
 
-    satirlar.append("")
-    satirlar.append("=" * 30)
-    if hata_sayisi == 0 and uyari_sayisi == 0:
-        satirlar.append("SONUC: TUM SISTEMLER NORMAL")
-        satirlar.append("Bot calismaya hazir.")
-    elif hata_sayisi == 0:
-        satirlar.append(f"SONUC: {uyari_sayisi} UYARI, HATA YOK")
-        satirlar.append("Bot calisiyor, uyarilari inceleyin.")
+    lines.append("")
+    lines.append("=" * 30)
+    if error_count == 0 and warn_count == 0:
+        lines.append("SONUC: TUM SISTEMLER NORMAL")
+    elif error_count == 0:
+        lines.append(f"SONUC: {warn_count} UYARI, HATA YOK")
     else:
-        satirlar.append(f"SONUC: {hata_sayisi} HATA  {uyari_sayisi} UYARI")
-        satirlar.append("Hatalari duzeltmeden islem yapmayin!")
+        lines.append(f"SONUC: {error_count} HATA  {warn_count} UYARI")
 
-    telegram_mesaj_gonder("\n".join(satirlar))
+    send_telegram("\n".join(lines))
 
 # ── /yardim ───────────────────────────────────────────────────────────────────
 @t_bot.message_handler(commands=['yardim', 'help'])
-def cmd_yardim(message):
-    telegram_mesaj_gonder(
-        "<b>Komut Listesi — v3.7</b>\n"
-        "/durum       — Bot, pozisyon ve ban durumu\n"
-        "/bakiye      — Cuzdan ve net kazanc\n"
-        "/pnl         — PnL ozeti\n"
-        "/son         — Son 5 kapali islem\n"
-        "/tara        — 8 sembolun tarama tablosu\n"
-        "/piyasa      — En iyi sembolun 7 gosterge analizi\n"
-        "/backtest    — Tum semboller icin backtest\n"
-        "/saglik      — Tam sistem saglik kontrolu\n"
-        "/dur         — Botu duraklatir\n"
-        "/start       — Botu baslatir\n"
-        "/yardim      — Bu menu",
-        reply_markup=ana_klavye()
+def cmd_help(message):
+    send_telegram(
+        "<b>Komut Listesi — v3.9</b>\n"
+        "/durum            — Tum acik pozisyonlar + ban durumu\n"
+        "/balance           — Cuzdan ve net profit\n"
+        "/pnl              — PnL ozeti\n"
+        "/istatistik       — Sembol/yon/hour bazli detayli analiz\n"
+        "/son              — Son 5 kapali islem\n"
+        "/tara             — 16 sembolun scan tablosu\n"
+        "/piyasa           — En iyi sembolun tam analizi\n"
+        "/backtest         — Tum semboller icin backtest\n"
+        "/saglik           — Tam sistem saglik kontrolu\n"
+        "/kapat            — Tum acik pozisyonlari kapat (ACIL)\n"
+        "/kapat SEMBOL     — Belirli pozisyonu kapat\n"
+        "/dur              — Botu duraklatir\n"
+        "/start            — Botu baslatir\n"
+        "/yardim           — Bu menu",
+        reply_markup=main_keyboard()
     )
 
 # ==============================================================================
 # 6. CORE HELPERS
 # ==============================================================================
-
-def son_fiyat_al(sembol):
+def get_price(symbol):
     try:
-        ticker = api_cagir(exchange.fetch_ticker, sembol)
+        ticker = api_call(exchange.fetch_ticker, symbol)
         return float(ticker['last'])
     except Exception as e:
-        print(f"[Fiyat Hatasi {sembol}] {e}")
+        print(f"[Fiyat Hatasi {symbol}] {e}")
         return 0.0
 
 def get_balance():
     try:
-        balance = api_cagir(exchange.fetch_balance)
+        balance = api_call(exchange.fetch_balance)
         return float(balance['total'].get('USDT', 0))
     except Exception as e:
         print(f"[Bakiye Hatasi] {e}")
         return 0.0
 
-def ucret_hesapla(notional):
+def calc_fee(notional):
     return notional * CONFIG['TAKER_FEE'] * 2
 
-# ── Bracket Order Helpers ─────────────────────────────────────────────────────
+def calc_tp_rate(side='LONG', leverage=None):
+    """Return effective TP price-move ratio for given side and leverage."""
+    if leverage is None:
+        leverage = CONFIG['LEVERAGE']
+    if CONFIG['TP_ROI_MODE']:
+        roi = (CONFIG['TP_ROI_TARGET'] if side == 'LONG'
+               else CONFIG['TP_ROI_TARGET_SHORT'])
+        return roi / leverage
+    return CONFIG['TP_RATE']
 
-def bracket_emir_iptal(sembol):
-    """Cancel both SL and TP exchange-side orders if they exist."""
-    global aktif_sl_order_id, aktif_tp_order_id
-    for oid_attr in ['aktif_sl_order_id', 'aktif_tp_order_id']:
-        oid = globals()[oid_attr]
-        if oid:
-            try:
-                api_cagir(exchange.cancel_order, oid, sembol)
-                print(f"[Bracket] Iptal edildi: {oid_attr} = {oid}")
-            except Exception as e:
-                print(f"[Bracket Iptal] {oid_attr} iptal hatasi: {e}")
-            globals()[oid_attr] = None
+def calc_dynamic_leverage(adx):
+    """Return trade leverage scaled by ADX strength."""
+    base = CONFIG['LEVERAGE']
+    if not CONFIG['DYNAMIC_LEVERAGE']:
+        return base
+    extra = max(0, round((adx - CONFIG['ADX_THRESHOLD']) / 10))
+    return min(base + extra, CONFIG['MAX_LEVERAGE'])
 
-
-def bracket_emir_gonder(sembol, side, sl_fiyat, tp_fiyat):
-    """
-    Place STOP_MARKET (SL) and TAKE_PROFIT_MARKET (TP) on Binance.
-    Uses closePosition=True so no quantity is needed.
-    workingType=MARK_PRICE is more reliable than last price for stops.
-    Returns (sl_order_id, tp_order_id) — either may be None on failure.
-    """
-    global aktif_sl_order_id, aktif_tp_order_id, son_exchange_sl
-    close_side = 'sell' if side == 'AL' else 'buy'
-    sl_oid = None
-    tp_oid = None
-
-    # Round prices to exchange precision
-    try:
-        sl_fiyat = float(exchange.price_to_precision(sembol, sl_fiyat))
-        tp_fiyat = float(exchange.price_to_precision(sembol, tp_fiyat))
-    except Exception:
-        pass
-
-    # Place SL — STOP_MARKET
-    try:
-        sl_emir = api_cagir(
-            exchange.create_order,
-            sembol, 'STOP_MARKET', close_side, None, None,
-            params={
-                'stopPrice':    sl_fiyat,
-                'closePosition': True,
-                'reduceOnly':   True,
-                'workingType':  'MARK_PRICE',
-            }
-        )
-        sl_oid = sl_emir.get('id')
-        aktif_sl_order_id = sl_oid
-        son_exchange_sl   = sl_fiyat
-        print(f"[Bracket] STOP_MARKET yerlestirildi: {sl_fiyat} id={sl_oid}")
-    except Exception as e:
-        telegram_mesaj_gonder(
-            f"UYARI: Exchange-side SL yerleştirilemedi\n"
-            f"Sembol: {sembol}\n"
-            f"Hata: {str(e)[:80]}\n"
-            f"Bot yine de yazilim SL ile devam ediyor."
-        )
-        print(f"[Bracket SL Hatasi] {e}")
-
-    # Place TP — TAKE_PROFIT_MARKET
-    try:
-        tp_emir = api_cagir(
-            exchange.create_order,
-            sembol, 'TAKE_PROFIT_MARKET', close_side, None, None,
-            params={
-                'stopPrice':    tp_fiyat,
-                'closePosition': True,
-                'reduceOnly':   True,
-                'workingType':  'MARK_PRICE',
-            }
-        )
-        tp_oid = tp_emir.get('id')
-        aktif_tp_order_id = tp_oid
-        print(f"[Bracket] TAKE_PROFIT_MARKET yerlestirildi: {tp_fiyat} id={tp_oid}")
-    except Exception as e:
-        telegram_mesaj_gonder(
-            f"UYARI: Exchange-side TP yerleştirilemedi\n"
-            f"Sembol: {sembol}\n"
-            f"Hata: {str(e)[:80]}\n"
-            f"Bot yine de yazilim TP ile devam ediyor."
-        )
-        print(f"[Bracket TP Hatasi] {e}")
-
-    return sl_oid, tp_oid
-
-
-def sl_order_guncelle(sembol, side, yeni_sl):
-    """
-    Update the exchange-side STOP_MARKET if the new SL is at least
-    SL_UPDATE_ESIK better than the last sent price.
-    Binance doesn't support order modification, so: cancel + replace.
-    """
-    global aktif_sl_order_id, son_exchange_sl
-
-    if not CONFIG['BRACKET_EMIR']:
-        return
-    if aktif_sl_order_id is None:
-        return
-
-    # Check improvement threshold
-    if son_exchange_sl > 0:
-        if side == 'AL':
-            improvement = (yeni_sl - son_exchange_sl) / son_exchange_sl
-        else:
-            improvement = (son_exchange_sl - yeni_sl) / son_exchange_sl
-        if improvement < CONFIG['SL_UPDATE_ESIK']:
-            return   # Not improved enough — skip update
-
-    close_side = 'sell' if side == 'AL' else 'buy'
-    try:
-        yeni_sl_prec = float(exchange.price_to_precision(sembol, yeni_sl))
-    except Exception:
-        yeni_sl_prec = yeni_sl
-
-    # Cancel old SL
-    try:
-        api_cagir(exchange.cancel_order, aktif_sl_order_id, sembol)
-        aktif_sl_order_id = None
-    except Exception as e:
-        print(f"[SL Guncelle] Eski SL iptal hatasi: {e}")
-
-    # Place new SL
-    try:
-        yeni_emir = api_cagir(
-            exchange.create_order,
-            sembol, 'STOP_MARKET', close_side, None, None,
-            params={
-                'stopPrice':    yeni_sl_prec,
-                'closePosition': True,
-                'reduceOnly':   True,
-                'workingType':  'MARK_PRICE',
-            }
-        )
-        aktif_sl_order_id = yeni_emir.get('id')
-        son_exchange_sl   = yeni_sl_prec
-        print(f"[SL Guncelle] Yeni SL: {yeni_sl_prec} id={aktif_sl_order_id}")
-    except Exception as e:
-        print(f"[SL Guncelle] Yeni SL yerlesirme hatasi: {e}")
-
-
-# ── Limit Order Entry with Market Fallback ────────────────────────────────────
-
-def limit_emir_gonder(sembol, side_ccxt, miktar, referans_fiyat):
-    """
-    Attempt a limit order at the best bid (buy) or ask (sell).
-    Waits up to LIMIT_BEKLEME_SN seconds for fill.
-    Falls back to market order if unfilled.
-    Returns the fill order dict (same structure as create_market_order).
-    """
-    # Pre-entry slippage guard
-    try:
-        ticker     = api_cagir(exchange.fetch_ticker, sembol)
-        anlik_fiyat = float(ticker['last'])
-        kayma       = abs(anlik_fiyat - referans_fiyat) / referans_fiyat
-        if kayma > CONFIG['MAX_KAYMA_PCT']:
-            print(f"[Kayma Asimi] {sembol} referans:{referans_fiyat:.4f} "
-                  f"anlik:{anlik_fiyat:.4f} kayma:%{kayma*100:.3f} — ATLA")
-            telegram_mesaj_gonder(
-                f"Giris atildi — kayma fazla\n"
-                f"Sembol  : {sembol}\n"
-                f"Sinyal  : {referans_fiyat:.4f}\n"
-                f"Su an   : {anlik_fiyat:.4f}\n"
-                f"Kayma   : %{kayma*100:.3f} (max %{CONFIG['MAX_KAYMA_PCT']*100:.2f})"
-            )
-            return None
-
-        # Set limit price: buy at best ask, sell at best bid (instant fill attempt)
-        if side_ccxt == 'buy':
-            limit_fiyat = float(ticker.get('ask') or anlik_fiyat)
-        else:
-            limit_fiyat = float(ticker.get('bid') or anlik_fiyat)
-
-        limit_fiyat = float(exchange.price_to_precision(sembol, limit_fiyat))
-    except Exception as e:
-        print(f"[Limit Emir] Ticker hatasi, market order'a geciliyor: {e}")
-        return api_cagir(exchange.create_market_order, sembol, side_ccxt, miktar)
-
-    # Place limit order
-    try:
-        limit_emir = api_cagir(
-            exchange.create_limit_order,
-            sembol, side_ccxt, miktar, limit_fiyat,
-            params={'timeInForce': 'GTC'}
-        )
-        emir_id = limit_emir.get('id')
-        print(f"[Limit Emir] Yerlestirildi: {limit_fiyat} id={emir_id}")
-    except Exception as e:
-        print(f"[Limit Emir] Limit basarisiz, market'e geciliyor: {e}")
-        return api_cagir(exchange.create_market_order, sembol, side_ccxt, miktar)
-
-    # Wait for fill
-    bitis = time.time() + CONFIG['LIMIT_BEKLEME_SN']
-    while time.time() < bitis:
-        time.sleep(1)
-        try:
-            durum = api_cagir(exchange.fetch_order, emir_id, sembol)
-            if durum.get('status') == 'closed':
-                print(f"[Limit Emir] Dolduruldu: {durum.get('average')}")
-                return durum
-            if durum.get('status') in ('canceled', 'rejected', 'expired'):
-                print(f"[Limit Emir] Iptal/Reddedildi: {durum.get('status')}")
-                break
-        except Exception as e:
-            print(f"[Limit Emir Kontrol] {e}")
-            break
-
-    # Cancel unfilled limit and fall back to market
-    try:
-        api_cagir(exchange.cancel_order, emir_id, sembol)
-        print(f"[Limit Emir] Dolmadiginda iptal, market'e geciliyor")
-    except Exception as e:
-        print(f"[Limit Iptal] {e}")
-
-    return api_cagir(exchange.create_market_order, sembol, side_ccxt, miktar)
-
-
-def tp_orani_hesapla():
-    """
-    Returns the effective TP price-move ratio based on config mode.
-    ROI mode  : target_roi / leverage  (e.g. 10% ROI / 5x = 2% price move)
-    Price mode: TP_ORANI directly.
-    """
-    if CONFIG['TP_ROI_MOD']:
-        return CONFIG['TP_ROI_HEDEF'] / CONFIG['LEVERAGE']
-    return CONFIG['TP_ORANI']
-
-
-def gunluk_zarar_kontrol():
-    global bot_aktif_mi
+def check_daily_loss():
+    global bot_active
     if not os.path.isfile(CONFIG['LOG_FILE']):
         return True
     try:
         df = pd.read_csv(CONFIG['LOG_FILE'], delimiter=';',
                          on_bad_lines='skip', engine='python')
-        df['Zaman'] = pd.to_datetime(df['Zaman'])
-        bugun = df[
-            (df['Zaman'] > datetime.now().replace(
-                hour=0, minute=0, second=0)) &
-            (df['Durum'] == 'KAPANDI')
+        df['Time'] = pd.to_datetime(df['Time'])
+        today = df[
+            (df['Time'] > datetime.now().replace(hour=0, minute=0, second=0)) &
+            (df['Status'] == 'CLOSED')
         ]
-        if bugun.empty:
-            return True
+        if today.empty: return True
         daily_pnl = pd.to_numeric(
-            bugun['PnL_USD_net'], errors='coerce').sum()
+            today['PnL_USD_net'], errors='coerce').sum()
         bal  = get_balance()
         ref  = bal + abs(daily_pnl) if bal > 0 else 1
-        oran = abs(daily_pnl) / ref if daily_pnl < 0 else 0
-        if oran >= CONFIG['GUNLUK_MAX_ZARAR']:
+        ratio = abs(daily_pnl) / ref if daily_pnl < 0 else 0
+        if ratio >= CONFIG['DAILY_MAX_LOSS']:
             with state_lock:
-                bot_aktif_mi = False
-            telegram_mesaj_gonder(
+                bot_active = False
+            send_telegram(
                 f"<b>DEVRE KESICI</b>\n"
                 f"Gunluk kayip limiti asildi!\n"
-                f"Kayip : {daily_pnl:.2f} USDT (%{oran*100:.1f})\n"
-                f"Limit : %{CONFIG['GUNLUK_MAX_ZARAR']*100:.0f}\n"
+                f"Kayip : {daily_pnl:.2f} USDT (%{ratio*100:.1f})\n"
+                f"Limit : %{CONFIG['DAILY_MAX_LOSS']*100:.0f}\n"
                 f"Bot DURDURULDU. /start ile yeniden baslatIn."
             )
             return False
@@ -1254,19 +1038,17 @@ def gunluk_zarar_kontrol():
         return True
 
 def log_trade(data, current_balance):
-    data['Bakiye_USDT'] = round(current_balance, 2)
+    data['Balance_USDT'] = round(current_balance, 2)
     fieldnames = [
-        'Zaman', 'Sembol', 'Durum', 'Yon', 'Hacim_USD',
-        'Fiyat', 'PnL_Yuzde_lev', 'PnL_USD_brut', 'Ucret_USD',
-        'PnL_USD_net', 'Kapanma_Sebebi', 'Bakiye_USDT'
+        'Time', 'Symbol', 'Status', 'Side', 'Volume_USD', 'Price',
+        'PnL_Pct_lev', 'PnL_USD_gross', 'Fee_USD', 'PnL_USD_net',
+        'Close_Reason', 'Balance_USDT'
     ]
     file_exists = os.path.isfile(CONFIG['LOG_FILE'])
     try:
         with open(CONFIG['LOG_FILE'], mode='a', newline='') as f:
-            writer = csv.DictWriter(
-                f, fieldnames=fieldnames, delimiter=';',
-                quoting=csv.QUOTE_ALL, extrasaction='ignore'
-            )
+            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=';',
+                                    quoting=csv.QUOTE_ALL, extrasaction='ignore')
             if not file_exists:
                 writer.writeheader()
             writer.writerow({k: data.get(k, '-') for k in fieldnames})
@@ -1274,492 +1056,684 @@ def log_trade(data, current_balance):
         print(f"[Log Hatasi] {e}")
 
 # ==============================================================================
-# 7. MARKET DATA + BASE INDICATORS
+# 7. BRACKET ORDER HELPERS
 # ==============================================================================
+def _cancel_all_stop_orders(symbol, pos):
+    """
+    Cancel ALL open STOP_MARKET and TAKE_PROFIT_MARKET orders for a symbol
+    by fetching live open orders — not by stored IDs.
 
-def ohlcv_al(sembol, tf, limit=200):
-    bars = api_cagir(
-        exchange.fetch_ohlcv, sembol, timeframe=tf, limit=limit
-    )
-    df = pd.DataFrame(
-        bars,
-        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-    )
+    Why: Binance auto-cancels the paired order when one fires (e.g. TP hits →
+    Binance deletes SL). Our stored ID becomes stale (-2011). Fetching live
+    orders is always accurate.
+    """
+    try:
+        open_orders = api_call(exchange.fetch_open_orders, symbol)
+        hedef_tipler = {'stop_market', 'take_profit_market',
+                        'STOP_MARKET', 'TAKE_PROFIT_MARKET'}
+        cancel_count = 0
+        for order in open_orders:
+            tip = str(order.get('type', '')).upper()
+            if tip in {'STOP_MARKET', 'TAKE_PROFIT_MARKET'}:
+                try:
+                    api_call(exchange.cancel_order, order['id'], symbol)
+                    cancel_count += 1
+                    print(f"[Bracket Iptal] {symbol} {tip} id={order['id']}")
+                except Exception as e:
+                    # -2011 = already gone, safe to ignore
+                    if '-2011' not in str(e):
+                        print(f"[Bracket Iptal Hata] {order['id']}: {e}")
+        if cancel_count == 0:
+            print(f"[Bracket Iptal] {symbol}: Acik stop emri bulunamadi (zaten kapali)")
+    except Exception as e:
+        print(f"[Bracket Iptal Genel] {symbol}: {e}")
+    finally:
+        # Always clear stored IDs regardless of what happened
+        if pos is not None:
+            pos['sl_order_id'] = None
+            pos['tp_order_id'] = None
+
+
+def cancel_bracket_orders(symbol, pos):
+    """Public alias — cancels all live stop orders for this symbol."""
+    _cancel_all_stop_orders(symbol, pos)
+
+def place_bracket_orders(symbol, side, sl_fiyat, tp_fiyat, pos):
+    """Place STOP_MARKET + TAKE_PROFIT_MARKET. Updates pos dict in place."""
+    close_side = 'sell' if side == 'LONG' else 'buy'
+    try:
+        sl_fiyat = float(exchange.price_to_precision(symbol, sl_fiyat))
+        tp_fiyat = float(exchange.price_to_precision(symbol, tp_fiyat))
+    except Exception:
+        pass
+
+    # STOP_MARKET
+    try:
+        sl_emir = api_call(
+            exchange.create_order,
+            symbol, 'STOP_MARKET', close_side, None, None,
+            params={
+                'stopPrice':     sl_fiyat,
+                'closePosition': True,
+                'workingType':   'MARK_PRICE',
+            }
+        )
+        pos['sl_order_id']    = sl_emir.get('id')
+        pos['last_exchange_sl'] = sl_fiyat
+        print(f"[Bracket SL] {symbol} {sl_fiyat} id={pos['sl_order_id']}")
+    except Exception as e:
+        send_telegram(
+            f"UYARI: Exchange SL yerleştirilemedi\n"
+            f"Sembol: {symbol}\nHata: {str(e)[:80]}\n"
+            f"Yazilim SL aktif."
+        )
+
+    # TAKE_PROFIT_MARKET
+    try:
+        tp_emir = api_call(
+            exchange.create_order,
+            symbol, 'TAKE_PROFIT_MARKET', close_side, None, None,
+            params={
+                'stopPrice':     tp_fiyat,
+                'closePosition': True,
+                'workingType':   'MARK_PRICE',
+            }
+        )
+        pos['tp_order_id'] = tp_emir.get('id')
+        print(f"[Bracket TP] {symbol} {tp_fiyat} id={pos['tp_order_id']}")
+    except Exception as e:
+        send_telegram(
+            f"UYARI: Exchange TP yerleştirilemedi\n"
+            f"Sembol: {symbol}\nHata: {str(e)[:80]}"
+        )
+
+def update_sl_order(symbol, side, new_sl, pos):
+    """
+    Update exchange-side STOP_MARKET when trailing stop improves enough.
+
+    Strategy:
+    1. Check improvement threshold — skip if not worth updating.
+    2. Fetch live open orders for this symbol.
+    3. Cancel any existing STOP_MARKET orders found (by live ID, not stored ID).
+       If none found, the slot is already empty — safe to place new one.
+    4. Place new STOP_MARKET only after confirming slot is clear.
+    """
+    if not CONFIG['BRACKET_ORDERS']:
+        return
+    ex_sl = pos.get('last_exchange_sl', 0)
+    if ex_sl > 0:
+        improvement = ((new_sl - ex_sl) / ex_sl if side == 'LONG'
+                       else (ex_sl - new_sl) / ex_sl)
+        if improvement < CONFIG['SL_UPDATE_THRESHOLD']:
+            return
+    close_side = 'sell' if side == 'LONG' else 'buy'
+    try:
+        new_sl_prec = float(exchange.price_to_precision(symbol, new_sl))
+    except Exception:
+        new_sl_prec = new_sl
+
+    # Step 1: Cancel ALL existing STOP_MARKET orders via live fetch
+    slot_clear = True
+    try:
+        open_orders = api_call(exchange.fetch_open_orders, symbol)
+        stop_orders = [e for e in open_orders
+                        if str(e.get('type','')).upper() == 'STOP_MARKET']
+        for order in stop_orders:
+            try:
+                api_call(exchange.cancel_order, order['id'], symbol)
+                print(f"[SL Guncelle] Eski SL iptal: id={order['id']}")
+            except Exception as e:
+                if '-2011' in str(e):
+                    # Already gone — slot is clear
+                    pass
+                else:
+                    # Unknown error — do not place new order, might double-up
+                    print(f"[SL Guncelle] Iptal hatasi, yeni SL yerlestirilmedi: {e}")
+                    slot_clear = False
+    except Exception as e:
+        print(f"[SL Guncelle] Acik emirler alinamadi: {e}")
+        slot_clear = False
+
+    if not slot_clear:
+        return
+
+    # Step 2: Place new STOP_MARKET
+    try:
+        order = api_call(
+            exchange.create_order,
+            symbol, 'STOP_MARKET', close_side, None, None,
+            params={
+                'stopPrice':     new_sl_prec,
+                'closePosition': True,
+                'workingType':   'MARK_PRICE',
+            }
+        )
+        pos['sl_order_id']     = order.get('id')
+        pos['last_exchange_sl'] = new_sl_prec
+        print(f"[SL Guncelle] Yeni SL: {symbol} {new_sl_prec} id={order.get('id')}")
+    except Exception as e:
+        if '-4130' in str(e):
+            # An existing closePosition order is still there — fetch and store its ID
+            print(f"[SL Guncelle] -4130: Mevcut order ID aliniyor...")
+            try:
+                emirler = api_call(exchange.fetch_open_orders, symbol)
+                for e2 in emirler:
+                    if str(e2.get('type','')).upper() == 'STOP_MARKET':
+                        pos['sl_order_id'] = e2['id']
+                        print(f"[SL Guncelle] Mevcut SL ID guncellendi: {e2['id']}")
+                        break
+            except Exception as e3:
+                print(f"[SL Guncelle] ID kurtarma hatasi: {e3}")
+        else:
+            print(f"[SL Guncelle] Yeni SL yerlesirilemedi: {e}")
+
+# ==============================================================================
+# 8. LIMIT ORDER ENTRY WITH MARKET FALLBACK + SLIPPAGE GUARD
+# ==============================================================================
+def place_limit_order(symbol, side_ccxt, qty, referans_fiyat):
+    try:
+        ticker      = api_call(exchange.fetch_ticker, symbol)
+        anlik_fiyat = float(ticker['last'])
+        kayma       = abs(anlik_fiyat - referans_fiyat) / referans_fiyat
+        if kayma > CONFIG['MAX_SLIPPAGE_PCT']:
+            send_telegram(
+                f"Giris atildi — kayma fazla\n"
+                f"Sembol: {symbol}\n"
+                f"Sinyal: {referans_fiyat:.4f} | Su an: {anlik_fiyat:.4f}\n"
+                f"Kayma : %{kayma*100:.3f} (max %{CONFIG['MAX_SLIPPAGE_PCT']*100:.2f})"
+            )
+            return None
+        limit_fiyat = float(
+            ticker.get('ask' if side_ccxt == 'buy' else 'bid') or anlik_fiyat
+        )
+        limit_fiyat = float(exchange.price_to_precision(symbol, limit_fiyat))
+    except Exception as e:
+        print(f"[Limit Ticker Hatasi] {e}")
+        return api_call(exchange.create_market_order, symbol, side_ccxt, qty)
+
+    try:
+        limit_emir = api_call(
+            exchange.create_limit_order,
+            symbol, side_ccxt, qty, limit_fiyat,
+            params={'timeInForce': 'GTC'}
+        )
+        emir_id = limit_emir.get('id')
+    except Exception as e:
+        print(f"[Limit Emir Hata] {e} — market'e geciliyor")
+        return api_call(exchange.create_market_order, symbol, side_ccxt, qty)
+
+    expiry = time.time() + CONFIG['LIMIT_WAIT_SECONDS']
+    while time.time() < expiry:
+        time.sleep(1)
+        try:
+            durum = api_call(exchange.fetch_order, emir_id, symbol)
+            if durum.get('status') == 'closed':
+                return durum
+            if durum.get('status') in ('canceled', 'rejected', 'expired'):
+                break
+        except Exception:
+            break
+
+    try:
+        api_call(exchange.cancel_order, emir_id, symbol)
+    except Exception:
+        pass
+    return api_call(exchange.create_market_order, symbol, side_ccxt, qty)
+
+# ==============================================================================
+# 9. MARKET DATA + BASE INDICATORS
+# ==============================================================================
+def fetch_ohlcv(symbol, tf, limit=200):
+    bars = api_call(exchange.fetch_ohlcv, symbol, timeframe=tf, limit=limit)
+    df   = pd.DataFrame(bars,
+                        columns=['timestamp','open','high','low','close','volume'])
     return df
 
-def btc_trend_al():
+def get_btc_trend():
     try:
-        df = ohlcv_al(CONFIG['BTC_SEMBOL'], CONFIG['BTC_TF'], limit=220)
-        df['EMA200'] = EMAIndicator(
-            close=df['close'], window=200).ema_indicator()
+        df = fetch_ohlcv(CONFIG['BTC_SYMBOL'], CONFIG['BTC_TF'], limit=220)
+        df['EMA200'] = EMAIndicator(close=df['close'], window=200).ema_indicator()
         df.dropna(inplace=True)
         son = df.iloc[-2]
-        if son['close'] > son['EMA200']:   return 'YUKARI'
-        elif son['close'] < son['EMA200']: return 'ASAGI'
-        return 'NOTR'
+        if son['close'] > son['EMA200']:   return 'UP'
+        elif son['close'] < son['EMA200']: return 'DOWN'
+        return 'NEUTRAL'
     except Exception as e:
         print(f"[BTC Trend] {e}")
-        return 'NOTR'
+        return 'NEUTRAL'
 
-def htf_bias_al(sembol):
+def get_htf_bias(symbol):
     try:
-        df = ohlcv_al(sembol, CONFIG['BIAS_TF'], limit=80)
-        df['EMA50'] = EMAIndicator(
-            close=df['close'], window=50).ema_indicator()
-        df['ADX'] = ADXIndicator(
-            high=df['high'], low=df['low'],
-            close=df['close'], window=14).adx()
+        df = fetch_ohlcv(symbol, CONFIG['BIAS_TF'], limit=80)
+        df['EMA50'] = EMAIndicator(close=df['close'], window=50).ema_indicator()
+        df['ADX']   = ADXIndicator(high=df['high'], low=df['low'],
+                                   close=df['close'], window=14).adx()
         df.dropna(inplace=True)
         son = df.iloc[-2]
-        if son['ADX'] > CONFIG['ADX_ESIK']:
-            if son['close'] > son['EMA50']:   return 'YUKARI'
-            elif son['close'] < son['EMA50']: return 'ASAGI'
-        return 'NOTR'
+        if son['ADX'] > CONFIG['ADX_THRESHOLD']:
+            if son['close'] > son['EMA50']:   return 'UP'
+            elif son['close'] < son['EMA50']: return 'DOWN'
+        return 'NEUTRAL'
     except Exception as e:
-        print(f"[HTF Bias {sembol}] {e}")
-        return 'NOTR'
+        print(f"[HTF Bias {symbol}] {e}")
+        return 'NEUTRAL'
 
-def funding_rate_al(sembol):
+def get_funding_rate(symbol):
     try:
-        fr = api_cagir(exchange.fetch_funding_rate, sembol)
+        fr = api_call(exchange.fetch_funding_rate, symbol)
         return float(fr.get('fundingRate', 0) or 0)
     except Exception as e:
-        print(f"[Funding {sembol}] {e}")
+        print(f"[Funding {symbol}] {e}")
         return 0.0
 
 # ==============================================================================
-# 8. SINGLE-SYMBOL FULL ANALYSIS — 7-FACTOR SCORING ENGINE [New A/B]
+# 10. SINGLE-SYMBOL ANALYSIS ENGINE — 8 FACTORS (no RSI, BTC as factor) [v3.9]
 # ==============================================================================
-
-def sembol_analiz_et(sembol, btc_trend='NOTR', bypass_session=False):
+def analyze_symbol(symbol, btc_trend='NEUTRAL'):
     try:
-        # Fetch enough candles for MACD (26+9=35 minimum, 200 is ample)
-        df = ohlcv_al(sembol, CONFIG['ENTRY_TF'], limit=200)
+        df = fetch_ohlcv(symbol, CONFIG['ENTRY_TF'], limit=200)
 
-        # ── Hard-gate indicators ──────────────────────────────────────────────
-        df['ADX']    = ADXIndicator(
-            high=df['high'], low=df['low'],
-            close=df['close'], window=14).adx()
-        df['ATR']    = AverageTrueRange(
-            high=df['high'], low=df['low'],
-            close=df['close'], window=14).average_true_range()
-        df['RSI']    = RSIIndicator(
-            close=df['close'], window=14).rsi()
-        df['VOL_MA'] = df['volume'].rolling(20).mean()
+        df['ADX']     = ADXIndicator(high=df['high'], low=df['low'],
+                                     close=df['close'], window=14).adx()
+        df['ATR']     = AverageTrueRange(high=df['high'], low=df['low'],
+                                         close=df['close'], window=14
+                                         ).average_true_range()
+        df['VOL_MA']  = df['volume'].rolling(20).mean()
 
-        # ── Score-contributing indicators [New A] ─────────────────────────────
-        # StochRSI
-        stoch_ind    = StochRSIIndicator(
-            close=df['close'], window=14, smooth1=3, smooth2=3)
-        df['STOCH_K'] = stoch_ind.stochrsi_k()
-        df['STOCH_D'] = stoch_ind.stochrsi_d()
+        stoch         = StochRSIIndicator(close=df['close'],
+                                          window=14, smooth1=3, smooth2=3)
+        df['STOCH_K'] = stoch.stochrsi_k()
+        df['STOCH_D'] = stoch.stochrsi_d()
 
-        # MACD histogram
-        macd_ind     = MACD(
-            close=df['close'],
-            window_slow=26, window_fast=12, window_sign=9)
+        macd_ind        = MACD(close=df['close'],
+                               window_slow=26, window_fast=12, window_sign=9)
         df['MACD_HIST'] = macd_ind.macd_diff()
 
-        # EMA21 on entry timeframe
-        df['EMA21']  = EMAIndicator(
-            close=df['close'], window=21).ema_indicator()
-
-        # OBV and its EMA20
-        df['OBV']    = OnBalanceVolumeIndicator(
-            close=df['close'],
-            volume=df['volume']).on_balance_volume()
+        df['EMA21']   = EMAIndicator(close=df['close'], window=21).ema_indicator()
+        df['OBV']     = OnBalanceVolumeIndicator(close=df['close'],
+                                                 volume=df['volume']
+                                                 ).on_balance_volume()
         df['OBV_EMA'] = df['OBV'].ewm(span=20, adjust=False).mean()
 
         df.dropna(inplace=True)
         if len(df) < 4:
             return None
 
-        son  = df.iloc[-2]   # ANTI-REPAINTING: last closed candle
-        son2 = df.iloc[-3]   # one candle before son
-        son3 = df.iloc[-4]   # two candles before son
+        son  = df.iloc[-2]
+        son2 = df.iloc[-3]
+        son3 = df.iloc[-4]
 
-        # ── Read values ───────────────────────────────────────────────────────
-        fiyat    = float(son['close'])
+        price    = float(son['close'])
         atr      = float(son['ATR'])
-        rsi      = float(son['RSI'])
         adx      = float(son['ADX'])
         vol      = float(son['volume'])
         vol_ma   = float(son['VOL_MA'])
         vol_oran = vol / vol_ma if vol_ma > 0 else 0
-        atr_pct  = atr / fiyat if fiyat > 0 else 0
+        atr_pct  = atr / price if price > 0 else 0
 
-        stoch_k  = float(son['STOCH_K'])   # 0..1
-        stoch_d  = float(son['STOCH_D'])   # 0..1
-
+        stoch_k  = float(son['STOCH_K'])
+        stoch_d  = float(son['STOCH_D'])
         macd_h0  = float(son['MACD_HIST'])
         macd_h1  = float(son2['MACD_HIST'])
         macd_h2  = float(son3['MACD_HIST'])
-
         ema21    = float(son['EMA21'])
         obv      = float(son['OBV'])
         obv_ema  = float(son['OBV_EMA'])
-
         mum_yukari = float(son['close']) > float(son['open'])
 
-        # ── Hard gates ────────────────────────────────────────────────────────
-        hacim_ok = vol_oran >= CONFIG['HACIM_CARPAN']
-        vol_ok   = atr_pct  >= CONFIG['MIN_ATR_YUZDE']
+        volume_ok = vol_oran >= CONFIG['VOLUME_MULT']
+        vol_ok   = atr_pct  >= CONFIG['MIN_ATR_PCT']
 
-        if bypass_session:
-            session_ok = True
-        else:
-            saat_utc   = datetime.now(timezone.utc).hour
-            session_ok = (
-                CONFIG['SESSION_BASLANGIC'] <= saat_utc < CONFIG['SESSION_BITIS']
-                if CONFIG['SESSION_FILTRE'] else True
-            )
+        bias    = get_htf_bias(symbol)
+        funding = get_funding_rate(symbol)
 
-        bias    = htf_bias_al(sembol)
-        funding = funding_rate_al(sembol)
+        # ── Signal gate: StochRSI only. BTC trend is score factor. [v3.9] ─────
+        signal = 'WAIT'
+        if adx > CONFIG['ADX_THRESHOLD'] and volume_ok and vol_ok:
+            if stoch_k < CONFIG['STOCH_OVERSOLD']:
+                if funding <= CONFIG['MAX_FUNDING_RATE']:
+                    signal = 'LONG'
+            elif stoch_k > CONFIG['STOCH_OVERBOUGHT']:
+                if funding >= -CONFIG['MAX_FUNDING_RATE']:
+                    signal = 'SHORT'
 
-        # ── Signal direction — StochRSI gate + softened BTC filter ─────────────
-        # Gate: StochK (fast, sensitive) instead of RSI (slow, stays neutral).
-        # BTC filter: block only if BTC strongly opposes the direction,
-        #             not if it's merely trending the other way.
-        sinyal = 'BEKLE'
-        if adx > CONFIG['ADX_ESIK'] and hacim_ok and vol_ok and session_ok:
-            if stoch_k < CONFIG['STOCH_ASIRI_SATIS']:
-                if bias in ('YUKARI', 'NOTR') and btc_trend != 'ASAGI':
-                    if funding <= CONFIG['MAX_FUNDING_RATE']:
-                        sinyal = 'AL'
-            elif stoch_k > CONFIG['STOCH_ASIRI_ALIS']:
-                if bias in ('ASAGI', 'NOTR') and btc_trend != 'YUKARI':
-                    if funding >= -CONFIG['MAX_FUNDING_RATE']:
-                        sinyal = 'SAT'
+        score      = 0.0
+        macd_dir  = 'NEUTRAL'
+        obv_trend = 'NEUTRAL'
 
-        # ── 7-factor scoring [New B] ──────────────────────────────────────────
-        skor = 0.0
-        macd_dir  = "NOTR"
-        obv_trend = "NOTR"
-
-        if sinyal != 'BEKLE':
-            # 1. ADX — same as before
+        if signal != 'WAIT':
+            # 1. ADX strength
             adx_norm = min(adx / 50.0, 1.0)
 
-            # 2. RSI extremity
-            rsi_norm = min(abs(rsi - 50) / 30.0, 1.0)
-
-            # 3. Volume surge
+            # 2. Volume surge
             vol_norm = min((vol_oran - 1.0) / 3.0, 1.0) if vol_oran > 1 else 0.0
 
-            # 4. StochRSI: position + K/D crossover bonus
-            if sinyal == 'AL':
-                # K below 0.5 = oversold territory
+            # 3. StochRSI position + K/D crossover bonus
+            if signal == 'LONG':
                 stoch_norm = max(0.0, 1.0 - stoch_k * 2)
-                if stoch_k > stoch_d:   # momentum turning up
+                if stoch_k > stoch_d:
                     stoch_norm = min(stoch_norm * 1.2, 1.0)
-            else:   # SAT
-                stoch_norm = max(0.0, stoch_k * 2 - 1.0)
-                if stoch_k < stoch_d:   # momentum turning down
-                    stoch_norm = min(stoch_norm * 1.2, 1.0)
-
-            # 5. MACD histogram direction (2-candle momentum confirmation)
-            if sinyal == 'AL':
-                if macd_h0 > macd_h1 > macd_h2:
-                    macd_norm = 1.0;  macd_dir = "YUKARI-YUKARI"
-                elif macd_h0 > macd_h1:
-                    macd_norm = 0.6;  macd_dir = "YUKARI"
-                else:
-                    macd_norm = 0.0;  macd_dir = "ASAGI"
-            else:   # SAT
-                if macd_h0 < macd_h1 < macd_h2:
-                    macd_norm = 1.0;  macd_dir = "ASAGI-ASAGI"
-                elif macd_h0 < macd_h1:
-                    macd_norm = 0.6;  macd_dir = "ASAGI"
-                else:
-                    macd_norm = 0.0;  macd_dir = "YUKARI"
-
-            # 6. EMA21: price position relative to EMA21
-            if sinyal == 'AL':
-                ema21_norm = 1.0 if fiyat > ema21 else 0.0
             else:
-                ema21_norm = 1.0 if fiyat < ema21 else 0.0
+                stoch_norm = max(0.0, stoch_k * 2 - 1.0)
+                if stoch_k < stoch_d:
+                    stoch_norm = min(stoch_norm * 1.2, 1.0)
 
-            # 7. OBV trend vs its EMA20
-            if sinyal == 'AL':
+            # 4. MACD histogram direction (2-candle momentum)
+            if signal == 'LONG':
+                if macd_h0 > macd_h1 > macd_h2:
+                    macd_norm = 1.0; macd_dir = 'UP-UP'
+                elif macd_h0 > macd_h1:
+                    macd_norm = 0.6; macd_dir = 'UP'
+                else:
+                    macd_norm = 0.0; macd_dir = 'DOWN'
+            else:
+                if macd_h0 < macd_h1 < macd_h2:
+                    macd_norm = 1.0; macd_dir = 'DOWN-DOWN'
+                elif macd_h0 < macd_h1:
+                    macd_norm = 0.6; macd_dir = 'DOWN'
+                else:
+                    macd_norm = 0.0; macd_dir = 'UP'
+
+            # 5. EMA21 gradient distance [v3.9 — replaces binary]
+            ema_dist = abs(price - ema21) / (atr * 2) if atr > 0 else 0
+            ema_dist = min(ema_dist, 1.0)
+            if signal == 'LONG':
+                ema21_norm = ema_dist if price > ema21 else 0.0
+            else:
+                ema21_norm = ema_dist if price < ema21 else 0.0
+
+            # 6. OBV trend
+            if signal == 'LONG':
                 obv_norm  = 1.0 if obv > obv_ema else 0.0
-                obv_trend = "YUKARI" if obv > obv_ema else "ASAGI"
+                obv_trend = 'UP' if obv > obv_ema else 'DOWN'
             else:
                 obv_norm  = 1.0 if obv < obv_ema else 0.0
-                obv_trend = "ASAGI" if obv < obv_ema else "YUKARI"
+                obv_trend = 'DOWN' if obv < obv_ema else 'UP'
+
+            # 7. HTF 15m bias
+            if signal == 'LONG':
+                bias_norm = 1.0 if bias=='UP' else 0.5 if bias=='NEUTRAL' else 0.0
+            else:
+                bias_norm = 1.0 if bias=='DOWN' else 0.5 if bias=='NEUTRAL' else 0.0
+
+            # 8. BTC trend alignment [v3.9 — was hard gate] ──────────────────
+            if signal == 'LONG':
+                btc_norm = 1.0 if btc_trend=='UP' else 0.5 if btc_trend=='NEUTRAL' else 0.0
+            else:
+                btc_norm = 1.0 if btc_trend=='DOWN' else 0.5 if btc_trend=='NEUTRAL' else 0.0
+
+            # Funding bonus for SAT [v3.9]: high positive funding = paid to short
+            funding_bonus = 0.0
+            if signal == 'SHORT' and funding > CONFIG['MAX_FUNDING_RATE']:
+                funding_bonus = min(funding / 0.001, 0.05)  # up to +5% score
 
             # Candle direction multiplier
-            if sinyal == 'AL':
-                mum_mult = 1.10 if mum_yukari else 0.90
-            else:
-                mum_mult = 1.10 if not mum_yukari else 0.90
+            mum_mult = (1.10 if (signal == 'LONG' and mum_yukari) or
+                        (signal == 'SHORT' and not mum_yukari) else 0.90)
 
-            skor = (
-                CONFIG['SKOR_ADX_W']   * adx_norm   +
-                CONFIG['SKOR_RSI_W']   * rsi_norm   +
-                CONFIG['SKOR_VOL_W']   * vol_norm   +
-                CONFIG['SKOR_STOCH_W'] * stoch_norm +
-                CONFIG['SKOR_MACD_W']  * macd_norm  +
-                CONFIG['SKOR_EMA21_W'] * ema21_norm +
-                CONFIG['SKOR_OBV_W']   * obv_norm
-            ) * mum_mult
+            score = (
+                CONFIG['SCORE_ADX_W']   * adx_norm   +
+                CONFIG['SCORE_VOL_W']   * vol_norm   +
+                CONFIG['SCORE_STOCH_W'] * stoch_norm +
+                CONFIG['SCORE_MACD_W']  * macd_norm  +
+                CONFIG['SCORE_EMA21_W'] * ema21_norm +
+                CONFIG['SCORE_OBV_W']   * obv_norm   +
+                CONFIG['SCORE_BIAS_W']  * bias_norm  +
+                CONFIG['SCORE_BTC_W']   * btc_norm
+            ) * mum_mult + funding_bonus
         else:
-            # Still compute display values for /piyasa
-            macd_dir  = ("YUKARI" if macd_h0 > macd_h1 else "ASAGI")
-            obv_trend = ("YUKARI" if obv > obv_ema else "ASAGI")
+            macd_dir  = 'UP' if macd_h0 > macd_h1 else 'DOWN'
+            obv_trend = 'UP' if obv > obv_ema else 'DOWN'
 
         return {
-            'sembol':     sembol,    'fiyat':     fiyat,
-            'atr':        atr,       'atr_pct':   atr_pct,
-            'rsi':        rsi,       'adx':       adx,
-            'vol_oran':   vol_oran,  'bias':      bias,
-            'btc_trend':  btc_trend, 'funding':   funding,
-            'hacim_ok':   hacim_ok,  'vol_ok':    vol_ok,
-            'session_ok': session_ok,
-            # New indicator values
-            'stoch_k':    stoch_k,   'stoch_d':   stoch_d,
-            'macd_hist':  macd_h0,   'macd_dir':  macd_dir,
-            'ema21':      ema21,     'obv_trend':  obv_trend,
-            'mum_yukari': mum_yukari,
-            # Signal and score
-            'sinyal':     sinyal,    'skor':      skor,
+            'symbol':    symbol,   'price':    price,
+            'atr':       atr,      'atr_pct':  atr_pct,
+            'adx':       adx,      'bias':     bias,
+            'btc_trend': btc_trend,'funding':  funding,
+            'volume_ok':  volume_ok, 'vol_ok':   vol_ok,
+            'vol_oran':  vol_oran,
+            'stoch_k':   stoch_k,  'stoch_d':  stoch_d,
+            'macd_hist': macd_h0,  'macd_dir': macd_dir,
+            'ema21':     ema21,    'obv_trend': obv_trend,
+            'mum_yukari':mum_yukari,
+            'signal':    signal,   'score':     score,
         }
     except Exception as e:
-        print(f"[Analiz Hatasi {sembol}] {e}")
+        print(f"[Analiz Hatasi {symbol}] {e}")
         return None
 
 # ==============================================================================
-# 9. MULTI-SYMBOL SCANNER
+# 11. MULTI-SYMBOL SCANNER
 # ==============================================================================
-
-def sembol_tara(btc_trend):
+def scan_symbols(btc_trend):
     sonuclar = []
-    for sembol in CONFIG['SEMBOL_LISTESI']:
-        r = sembol_analiz_et(sembol, btc_trend)
+    for symbol in CONFIG['SYMBOL_LIST']:
+        r = analyze_symbol(symbol, btc_trend)
         if r:
             sonuclar.append(r)
-        time.sleep(0.4)
-    sonuclar.sort(key=lambda x: x['skor'], reverse=True)
+        time.sleep(0.3)
+    sonuclar.sort(key=lambda x: x['score'], reverse=True)
     return sonuclar
 
-def en_iyi_sinyal_sec(sonuclar):
+def select_best_signal(sonuclar, open_symbols=None):
     """
-    Picks highest-scoring non-BEKLE signal.
-    Skips temporarily banned symbols.
-    Applies small score jitter to prevent the same symbol
-    winning every single scan when scores are close.  [New C/D]
+    Pick the highest-scoring signal that:
+    - Is not BEKLE
+    - Is not already in an open position
+    - Is not temporarily banned
+    - Passes the correlation filter (no same-category if restricted)
     """
-    simdi = datetime.now()
-    candidates = []
+    if open_symbols is None:
+        open_symbols = []
+    simdi  = datetime.now()
+
+    # Build set of currently occupied categories
+    acik_kategoriler = set()
+    with state_lock:
+        for sym in open_symbols:
+            kat = CONFIG['SYMBOL_CATEGORIES'].get(sym, 'others')
+            if kat not in CONFIG['CORRELATION_FREE']:
+                acik_kategoriler.add(kat)
 
     for r in sonuclar:
-        if r['sinyal'] == 'BEKLE' or r['skor'] <= 0:
+        if r['signal'] == 'WAIT' or r['score'] <= 0:
             continue
+        sym = r['symbol']
+        # Skip already open
+        if sym in open_symbols:
+            continue
+        # Skip banned
         with state_lock:
-            ban_bitis = sembol_ban_bitis.get(r['sembol'])
-        if ban_bitis and simdi < ban_bitis:
-            continue    # symbol is temporarily banned
-        candidates.append(r)
-
-    if not candidates:
-        return None
-
-    # Add small random jitter to break score ties  [New D]
-    j = CONFIG['SKOR_JITTER_PCT']
-    candidates.sort(
-        key=lambda x: x['skor'] * (1 + random.uniform(-j, j)),
-        reverse=True
-    )
-    return candidates[0]
+            ban = symbol_ban_until.get(sym)
+        if ban and simdi < ban:
+            continue
+        # Correlation filter [v3.9]
+        kat = CONFIG['SYMBOL_CATEGORIES'].get(sym, 'others')
+        if kat not in CONFIG['CORRELATION_FREE'] and kat in acik_kategoriler:
+            continue
+        return r
+    return None
 
 # ==============================================================================
-# 10. POSITION SIZE
+# 12. POSITION SIZING
 # ==============================================================================
-
-def miktar_hesapla(sembol, fiyat, atr, balance):
+def calc_position_size(symbol, price, atr, balance, leverage):
     try:
-        risk_val = balance * CONFIG['RISK_ORANI']
-        sl_dist  = atr * CONFIG['ATR_SL_CARPAN'] if atr > 0 else fiyat * 0.01
-        qty      = risk_val / sl_dist
-        max_qty  = (balance * CONFIG['LEVERAGE'] * 0.95) / fiyat
-        qty      = min(qty, max_qty)
-        return float(exchange.amount_to_precision(sembol, qty))
+        risk_val  = balance * CONFIG['RISK_PCT']
+        sl_dist   = atr * CONFIG['ATR_SL_MULT_LONG'] if atr > 0 else price * 0.01
+        qty       = risk_val / sl_dist
+        # Cap 1: 95% of available leveraged balance
+        max_qty   = (balance * leverage * 0.95) / price
+        qty       = min(qty, max_qty)
+        # Cap 2: notional USD cap
+        if CONFIG.get('MAX_POSITION_USD', 0) > 0:
+            max_qty_usd = CONFIG['MAX_POSITION_USD'] / price
+            if qty * price > CONFIG['MAX_POSITION_USD']:
+                print(f"[Miktar Cap] {symbol} {qty*price:.1f}→{CONFIG['MAX_POSITION_USD']} USD")
+            qty = min(qty, max_qty_usd)
+        return float(exchange.amount_to_precision(symbol, qty))
     except Exception as e:
         print(f"[Miktar Hatasi] {e}")
         return 0.0
 
 # ==============================================================================
-# 11. TRAILING STOP
-# Called only from trade_loop — state_lock already held by caller
+# 13. TRAILING STOP — per-position [v3.9]
 # ==============================================================================
+def update_trailing_stop(price, pos):
+    """Update stop_loss in pos dict. Returns (new_sl, changed)."""
+    old_sl = pos['stop_loss']
+    side   = pos['side']
 
-def trailing_stop_guncelle(fiyat):
-    global stop_loss, highest_price, lowest_price, breakeven_reached
-
-    if active_side == 'AL':
-        highest_price = max(highest_price, fiyat)
-        raw_pnl = (fiyat - entry_price) / entry_price
-        if not breakeven_reached and raw_pnl >= CONFIG['BREAKEVEN_TETIK']:
-            breakeven_reached = True
-            new_sl = entry_price * 1.0002
-            if new_sl > stop_loss:
-                stop_loss = new_sl
-                telegram_mesaj_gonder(
-                    f"Breakeven SL aktif! [{active_sembol}]\n"
-                    f"SL -> {stop_loss:.4f}"
+    if side == 'LONG':
+        pos['highest_price'] = max(pos['highest_price'], price)
+        raw_pnl = (price - pos['entry_price']) / pos['entry_price']
+        if not pos['breakeven_reached'] and raw_pnl >= CONFIG['BREAKEVEN_TRIGGER']:
+            pos['breakeven_reached'] = True
+            new_sl = pos['entry_price'] * 1.0002
+            if new_sl > pos['stop_loss']:
+                pos['stop_loss'] = new_sl
+                send_telegram(
+                    f"Breakeven SL — {pos.get('symbol_ref','?')}\n"
+                    f"SL → {pos['stop_loss']:.4f}"
                 )
-        trail_sl = highest_price * (1 - CONFIG['TRAILING_ADIM'])
-        if trail_sl > stop_loss:
-            stop_loss = trail_sl
-
-    elif active_side == 'SAT':
-        lowest_price = min(lowest_price, fiyat)
-        raw_pnl = (entry_price - fiyat) / entry_price
-        if not breakeven_reached and raw_pnl >= CONFIG['BREAKEVEN_TETIK']:
-            breakeven_reached = True
-            new_sl = entry_price * 0.9998
-            if new_sl < stop_loss:
-                stop_loss = new_sl
-                telegram_mesaj_gonder(
-                    f"Breakeven SL aktif! [{active_sembol}]\n"
-                    f"SL -> {stop_loss:.4f}"
+        trail = pos['highest_price'] * (1 - CONFIG['TRAILING_STEP'])
+        if trail > pos['stop_loss']:
+            pos['stop_loss'] = trail
+    else:
+        pos['lowest_price'] = min(pos['lowest_price'], price)
+        raw_pnl = (pos['entry_price'] - price) / pos['entry_price']
+        if not pos['breakeven_reached'] and raw_pnl >= CONFIG['BREAKEVEN_TRIGGER']:
+            pos['breakeven_reached'] = True
+            new_sl = pos['entry_price'] * 0.9998
+            if new_sl < pos['stop_loss']:
+                pos['stop_loss'] = new_sl
+                send_telegram(
+                    f"Breakeven SL — {pos.get('symbol_ref','?')}\n"
+                    f"SL → {pos['stop_loss']:.4f}"
                 )
-        trail_sl = lowest_price * (1 + CONFIG['TRAILING_ADIM'])
-        if trail_sl < stop_loss:
-            stop_loss = trail_sl
+        trail = pos['lowest_price'] * (1 + CONFIG['TRAILING_STEP'])
+        if trail < pos['stop_loss']:
+            pos['stop_loss'] = trail
 
-    return stop_loss
+    return pos['stop_loss'], pos['stop_loss'] != old_sl
 
 # ==============================================================================
-# 12. POSITION RECONCILIATION
+# 14. STARTUP POSITION RECONCILIATION
 # ==============================================================================
-
-def acik_pozisyon_kontrol():
-    global in_position, active_side, active_sembol, entry_price
-    global active_miktar, stop_loss, highest_price, lowest_price
-    global breakeven_reached
+def reconcile_open_positions():
     try:
-        # CCXT perpetual futures format: 'HYPE/USDT' -> 'HYPE/USDT:USDT'
-        syms = [s + ':USDT' for s in CONFIG['SEMBOL_LISTESI']]
-        positions = api_cagir(exchange.fetch_positions, syms)
-
+        positions = api_call(exchange.fetch_positions, CONFIG['SYMBOL_LIST'])
         for pos in positions:
             amt = float(pos.get('contracts', 0) or 0)
-            if amt > 0:
-                raw_sym = pos.get('symbol', '')
-                matched = next(
-                    (s for s in CONFIG['SEMBOL_LISTESI']
-                     if s.replace('/', '') in raw_sym or raw_sym in s),
-                    raw_sym
-                )
-                with state_lock:
-                    active_sembol     = matched
-                    active_side       = (
-                        'AL' if pos.get('side') == 'long' else 'SAT'
-                    )
-                    entry_price       = float(pos.get('entryPrice', 0) or 0)
-                    active_miktar     = amt
-                    atr_est           = entry_price * 0.01
-                    stop_loss         = (
-                        entry_price - atr_est * CONFIG['ATR_SL_CARPAN']
-                        if active_side == 'AL'
-                        else entry_price + atr_est * CONFIG['ATR_SL_CARPAN']
-                    )
-                    highest_price     = entry_price
-                    lowest_price      = entry_price
-                    breakeven_reached = False
-                    in_position       = True
-
-                telegram_mesaj_gonder(
-                    f"Mevcut pozisyon tespit edildi\n"
-                    f"Sembol: {active_sembol} | Yon: {active_side}\n"
-                    f"Giris : {entry_price:.4f} | Miktar: {active_miktar}\n"
-                    f"Trailing SL takibi baslatildi."
-                )
-                return
+            if amt <= 0:
+                continue
+            raw_sym = pos.get('symbol', '')
+            matched = next(
+                (s for s in CONFIG['SYMBOL_LIST']
+                 if s.replace('/', '') in raw_sym or raw_sym in s),
+                raw_sym
+            )
+            entry = float(pos.get('entryPrice', 0) or 0)
+            side  = 'LONG' if pos.get('side') == 'long' else 'SHORT'
+            atr_e = entry * 0.01
+            sl_mult  = (CONFIG['ATR_SL_MULT_LONG'] if side == 'LONG'
+                     else CONFIG['ATR_SL_MULT_SHORT'])
+            sl    = (entry - atr_e * sl_mult if side == 'LONG'
+                     else entry + atr_e * sl_mult)
+            lev   = int(pos.get('leverage', CONFIG['LEVERAGE']) or CONFIG['LEVERAGE'])
+            pos   = {
+                'side':             side,
+                'entry_price':      entry,
+                'qty':           amt,
+                'qty_full':       amt,
+                'atr':              atr_e,
+                'leverage':         lev,
+                'stop_loss':        sl,
+                'highest_price':    entry,
+                'lowest_price':     entry,
+                'breakeven_reached':False,
+                'partial_tp_done':  False,
+                'open_time':        datetime.now(),
+                'sl_order_id':      None,
+                'tp_order_id':      None,
+                'last_exchange_sl':  0.0,
+                'symbol_ref':       matched,
+            }
+            with state_lock:
+                active_positions[matched] = pos
+            send_telegram(
+                f"Mevcut pozisyon tespit edildi\n"
+                f"Sembol: {matched} | Yon: {side}\n"
+                f"Giris : {entry:.4f} | Miktar: {amt}\n"
+                f"SL    : {sl:.4f}"
+            )
     except Exception as e:
         print(f"[Pozisyon Kontrol] {e}")
 
 # ==============================================================================
-# 13. BACKTESTING
+# 15. BACKTESTING (updated: StochRSI gate, asymmetric TP/SL)
 # ==============================================================================
-
-def backtest_calistir(sembol, tf, limit=300):
+def run_backtest(symbol, tf, limit=300):
     try:
-        bars = api_cagir(exchange.fetch_ohlcv, sembol, timeframe=tf, limit=limit)
-        df   = pd.DataFrame(
-            bars, columns=['timestamp','open','high','low','close','volume'])
-
-        df['ADX']     = ADXIndicator(
-            high=df['high'], low=df['low'], close=df['close'], window=14).adx()
-        df['ATR']     = AverageTrueRange(
-            high=df['high'], low=df['low'], close=df['close'], window=14
-        ).average_true_range()
-        df['RSI']     = RSIIndicator(close=df['close'], window=14).rsi()
+        bars = api_call(exchange.fetch_ohlcv, symbol, timeframe=tf, limit=limit)
+        df   = pd.DataFrame(bars,
+                            columns=['timestamp','open','high','low','close','volume'])
+        df['ADX']     = ADXIndicator(high=df['high'], low=df['low'],
+                                     close=df['close'], window=14).adx()
+        df['ATR']     = AverageTrueRange(high=df['high'], low=df['low'],
+                                         close=df['close'], window=14
+                                         ).average_true_range()
         df['VOL_MA']  = df['volume'].rolling(20).mean()
-        stoch         = StochRSIIndicator(
-            close=df['close'], window=14, smooth1=3, smooth2=3)
+        stoch         = StochRSIIndicator(close=df['close'],
+                                          window=14, smooth1=3, smooth2=3)
         df['STOCH_K'] = stoch.stochrsi_k()
         df['STOCH_D'] = stoch.stochrsi_d()
         macd          = MACD(close=df['close'],
                              window_slow=26, window_fast=12, window_sign=9)
-        df['MACD_HIST']  = macd.macd_diff()
-        df['EMA21']      = EMAIndicator(close=df['close'], window=21).ema_indicator()
-        df['OBV']        = OnBalanceVolumeIndicator(
-            close=df['close'], volume=df['volume']).on_balance_volume()
-        df['OBV_EMA']    = df['OBV'].ewm(span=20, adjust=False).mean()
+        df['MACD_HIST'] = macd.macd_diff()
         df.dropna(inplace=True)
         df.reset_index(drop=True, inplace=True)
 
         trades  = []
         in_pos  = False
         entry_p = sl_p = tp_p = 0.0
-        side    = ""
+        side    = ''
         equity  = 100.0
         peak    = 100.0
         max_dd  = 0.0
+        lev     = CONFIG['LEVERAGE']
 
         for i in range(2, len(df) - 1):
-            row   = df.iloc[i]
-            prev  = df.iloc[i - 1]
-            prev2 = df.iloc[i - 2]
-            fiyat = float(row['close'])
+            row  = df.iloc[i]
+            price = float(row['close'])
+            hok   = row['volume'] >= row['VOL_MA'] * CONFIG['VOLUME_MULT']
+            vok   = (row['ATR'] / price) >= CONFIG['MIN_ATR_PCT']
+            s_k   = float(row['STOCH_K'])
 
             if not in_pos:
-                hok = row['volume'] >= row['VOL_MA'] * CONFIG['HACIM_CARPAN']
-                vok = (row['ATR'] / fiyat) >= CONFIG['MIN_ATR_YUZDE']
-
-                # Signal gate mirrors live bot: StochRSI + ADX + volume/ATR
-                s_k = float(row['STOCH_K'])
-                if row['ADX'] > CONFIG['ADX_ESIK'] and hok and vok:
-                    if s_k < CONFIG['STOCH_ASIRI_SATIS']:
-                        in_pos  = True; side = 'AL'
-                        entry_p = fiyat
-                        sl_p    = fiyat - float(row['ATR']) * CONFIG['ATR_SL_CARPAN']
-                        tp_p    = fiyat * (1 + tp_orani_hesapla())
-                    elif s_k > CONFIG['STOCH_ASIRI_ALIS']:
-                        in_pos  = True; side = 'SAT'
-                        entry_p = fiyat
-                        sl_p    = fiyat + float(row['ATR']) * CONFIG['ATR_SL_CARPAN']
-                        tp_p    = fiyat * (1 - tp_orani_hesapla())
+                if row['ADX'] > CONFIG['ADX_THRESHOLD'] and hok and vok:
+                    if s_k < CONFIG['STOCH_OVERSOLD']:
+                        in_pos  = True; side = 'LONG'
+                        entry_p = price
+                        sl_p    = price - float(row['ATR']) * CONFIG['ATR_SL_MULT_LONG']
+                        tp_p    = price * (1 + calc_tp_rate('LONG', lev))
+                    elif s_k > CONFIG['STOCH_OVERBOUGHT']:
+                        in_pos  = True; side = 'SHORT'
+                        entry_p = price
+                        sl_p    = price + float(row['ATR']) * CONFIG['ATR_SL_MULT_SHORT']
+                        tp_p    = price * (1 - calc_tp_rate('SHORT', lev))
             else:
                 nxt   = df.iloc[i + 1]
-                is_sl = (
-                    (side == 'AL'  and float(nxt['low'])  <= sl_p) or
-                    (side == 'SAT' and float(nxt['high']) >= sl_p)
-                )
-                is_tp = (
-                    (side == 'AL'  and float(nxt['high']) >= tp_p) or
-                    (side == 'SAT' and float(nxt['low'])  <= tp_p)
-                )
+                is_sl = ((side=='LONG' and float(nxt['low'])<=sl_p) or
+                         (side=='SHORT' and float(nxt['high'])>=sl_p))
+                is_tp = ((side=='LONG' and float(nxt['high'])>=tp_p) or
+                         (side=='SHORT' and float(nxt['low'])<=tp_p))
                 if is_sl or is_tp:
-                    exit_price = tp_p if is_tp else sl_p
-                    reason     = 'TP' if is_tp else 'SL'
-                    raw_pnl    = (
-                        (exit_price - entry_p) / entry_p if side == 'AL'
-                        else (entry_p - exit_price) / entry_p
-                    )
-                    notional = equity * CONFIG['LEVERAGE']
+                    exit_p  = tp_p if is_tp else sl_p
+                    reason  = 'TP' if is_tp else 'SL'
+                    raw_pnl = ((exit_p - entry_p)/entry_p if side=='LONG'
+                               else (entry_p - exit_p)/entry_p)
+                    notional = equity * lev
                     gross    = raw_pnl * notional
                     fee      = notional * CONFIG['TAKER_FEE'] * 2
                     net      = gross - fee
@@ -1771,539 +1745,577 @@ def backtest_calistir(sembol, tf, limit=300):
                     in_pos = False
 
         if not trades:
-            return f"<b>Backtest [{sembol}]:</b> Sinyal olusumadi."
+            return f"<b>Backtest [{symbol}]:</b> Sinyal olusumadi."
 
         df_t = pd.DataFrame(trades)
-        kaz  = df_t[df_t['net'] > 0]
-        kay  = df_t[df_t['net'] <= 0]
-        wr   = len(kaz) / len(df_t) * 100
-        rr   = (
-            abs(kaz['net'].mean() / kay['net'].mean())
-            if not kay.empty and kay['net'].mean() != 0 else 0
-        )
+        wins  = df_t[df_t['net'] > 0]
+        losses  = df_t[df_t['net'] <= 0]
+        wr   = len(wins) / len(df_t) * 100
+        rr   = (abs(wins['net'].mean() / losses['net'].mean())
+                if not losses.empty and losses['net'].mean() != 0 else 0)
         ret  = (equity - 100) / 100 * 100
-
         return (
-            f"<b>Backtest — {sembol} ({tf})</b>\n"
-            f"Islem : {len(df_t)} | Kaz: {len(kaz)} | Kay: {len(kay)}\n"
+            f"<b>Backtest — {symbol} ({tf})</b>\n"
+            f"Islem : {len(df_t)} | Kaz:{len(wins)} | Kay:{len(losses)}\n"
             f"Win Rate      : <b>%{wr:.1f}</b>\n"
             f"Risk/Odul     : <b>{rr:.2f}</b>\n"
             f"Toplam Getiri : <b>%{ret:.2f}</b>\n"
             f"Maks Drawdown : <b>%{max_dd:.2f}</b>"
         )
     except Exception as e:
-        return f"Backtest hatasi ({sembol}): {e}"
+        return f"Backtest hatasi ({symbol}): {e}"
 
 # ==============================================================================
-# 14. MAIN TRADING LOOP
+# 16. MAIN TRADE LOOP — Multi-position architecture [v3.9]
 # ==============================================================================
-
 def trade_loop():
-    global in_position, entry_price, active_miktar, stop_loss
-    global active_side, active_sembol, bot_aktif_mi, son_rapor_zamani
-    global highest_price, lowest_price, breakeven_reached
-    global kayip_sonrasi_bekleme, son_tarama_sonuclari
-    global sembol_kayip_sayac, sembol_ban_bitis, poz_sync_sayac
-    global aktif_sl_order_id, aktif_tp_order_id, son_exchange_sl
+    global bot_active, last_report_time, last_scan_results
+    global symbol_loss_count, symbol_ban_until
+    global loss_cooldown_until
 
-    print("[AKTIF] Multi-symbol tarama dongusu baslatildi.")
-    HEARTBEAT_SANIYE = CONFIG['HEARTBEAT_DAKIKA'] * 60
+    print("[AKTIF] Multi-pozisyon scan dongusu baslatildi.")
+    HEARTBEAT_SANIYE = CONFIG['HEARTBEAT_MINUTES'] * 60
+    sync_counter   = 0
 
     while True:
         with state_lock:
-            _aktif = bot_aktif_mi
-        if not _aktif:
+            _active = bot_active
+        if not _active:
             time.sleep(30)
             continue
 
         try:
             current_balance = get_balance()
             if current_balance == 0:
-                time.sleep(CONFIG['LOOP_UYKU'])
+                time.sleep(CONFIG['LOOP_SLEEP'])
                 continue
 
-            if not gunluk_zarar_kontrol():
-                time.sleep(CONFIG['LOOP_UYKU'])
+            if not check_daily_loss():
+                time.sleep(CONFIG['LOOP_SLEEP'])
                 continue
 
-            # STEP A: Scan all symbols
-            btc_trend = btc_trend_al()
-            tarama    = sembol_tara(btc_trend)
+            # ── STEP A: Scan all symbols ──────────────────────────────────────
+            btc_trend = get_btc_trend()
+            scan    = scan_symbols(btc_trend)
             with state_lock:
-                son_tarama_sonuclari = tarama
+                last_scan_results = scan
 
-            # STEP B: Heartbeat
+            # ── STEP B: Heartbeat ─────────────────────────────────────────────
             with state_lock:
-                _rapor_zamani = son_rapor_zamani
-
-            if (datetime.now() - _rapor_zamani).seconds >= HEARTBEAT_SANIYE:
+                _rapor = last_report_time
+            if (datetime.now() - _rapor).seconds >= HEARTBEAT_SANIYE:
                 with state_lock:
-                    son_rapor_zamani = datetime.now()
-                    _in_pos  = in_position
-                    _side    = active_side
-                    _sembol  = active_sembol
-                    _entry   = entry_price
-                    _sl      = stop_loss
-                    _miktar  = active_miktar
-                    _bans    = {k: v for k, v in sembol_ban_bitis.items()
+                    last_report_time = datetime.now()
+                    _positions  = dict(active_positions)
+                    _bans    = {k: v for k, v in symbol_ban_until.items()
                                 if v > datetime.now()}
 
-                top3     = [r for r in tarama if r['sinyal'] != 'BEKLE'][:3]
+                top3 = [r for r in scan if r['signal'] != 'WAIT'][:3]
                 top3_str = "".join(
-                    f"  {r['sembol']} Skor:{r['skor']:.2f} "
-                    f"{r['sinyal']} MACD:{r['macd_dir']}\n"
+                    f"  {r['symbol']} Skor:{r['score']:.2f} "
+                    f"{r['signal']} MACD:{r['macd_dir']}\n"
                     for r in top3
                 ) or "  Sinyal yok\n"
+                ban_str = ("Banli: " + ", ".join(
+                    f"{s}({int((v-datetime.now()).seconds/60)}dk)"
+                    for s, v in _bans.items()
+                ) + "\n") if _bans else ""
+                poz_str = "\n".join(
+                    f"  {sym} {p['side']} {p['leverage']}x "
+                    f"entry:{p['entry_price']:.4f}"
+                    for sym, p in _positions.items()
+                ) or "  YOK"
 
-                ban_str = ""
-                if _bans:
-                    ban_str = "Banli: " + ", ".join(
-                        f"{s}({int((v-datetime.now()).seconds/60)}dk)"
-                        for s, v in _bans.items()
-                    ) + "\n"
-
-                poz_str = "YOK"
-                if _in_pos:
-                    f_now = son_fiyat_al(_sembol)
-                    raw   = (
-                        (f_now - _entry) / _entry if _side == 'AL'
-                        else (_entry - f_now) / _entry
-                    )
-                    lev = raw * CONFIG['LEVERAGE'] * 100
-                    usd = (
-                        _miktar * (f_now - _entry) if _side == 'AL'
-                        else _miktar * (_entry - f_now)
-                    )
-                    poz_str = (
-                        f"{_sembol} {_side}\n"
-                        f"  Giris: {_entry:.4f} | SL: {_sl:.4f}\n"
-                        f"  PnL: %{lev:.2f} ({usd:+.2f} USDT)"
-                    )
-
-                telegram_mesaj_gonder(
-                    f"<b>Periyodik Rapor "
-                    f"({datetime.now().strftime('%H:%M')})</b>\n"
-                    f"BTC: {btc_trend} | "
-                    f"Bakiye: <b>{current_balance:.2f} USDT</b>\n"
+                send_telegram(
+                    f"<b>Periyodik Rapor ({datetime.now().strftime('%H:%M')})</b>\n"
+                    f"BTC: {btc_trend} | Bakiye: <b>{current_balance:.2f} USDT</b>\n"
                     f"{ban_str}"
-                    f"Pozisyon: {poz_str}\n"
+                    f"Pozisyonlar ({len(_positions)}):\n{poz_str}\n"
                     f"<b>En Iyi Sinyaller:</b>\n{top3_str}"
                 )
 
-            # Snapshot state for this tick
+            # ── STEP C: Open new position(s) if capacity allows ───────────────
             with state_lock:
-                _in_pos        = in_position
-                _kayip_bekleme = kayip_sonrasi_bekleme
+                _positions = dict(active_positions)
+                _cooldown = loss_cooldown_until
 
-            # STEP C: Entry
-            if not _in_pos:
-                if _kayip_bekleme > 0:
-                    with state_lock:
-                        kayip_sonrasi_bekleme -= 1
-                    time.sleep(CONFIG['LOOP_UYKU'])
-                    continue
+            num_poz       = len(_positions)
+            total_margin  = sum(
+                p['qty'] * p['entry_price'] / p['leverage']
+                for p in _positions.values()
+            )
+            max_margin    = current_balance * CONFIG['MAX_TOTAL_MARGIN_PCT']
+            cooldown_aktif = _cooldown and datetime.now() < _cooldown
 
-                en_iyi = en_iyi_sinyal_sec(tarama)
-                if en_iyi:
-                    sembol = en_iyi['sembol']
-                    sinyal = en_iyi['sinyal']
-                    fiyat  = en_iyi['fiyat']
-                    atr    = en_iyi['atr']
-                    miktar = miktar_hesapla(
-                        sembol, fiyat, atr, current_balance
-                    )
-                    if miktar > 0:
-                        side_ccxt = 'buy' if sinyal == 'AL' else 'sell'
+            if (num_poz < CONFIG['MAX_CONCURRENT_POSITIONS']
+                    and total_margin < max_margin
+                    and not cooldown_aktif):
 
-                        # ── Slippage-controlled entry [Fix 2] ─────────────────
-                        if CONFIG['LIMIT_EMIR']:
-                            emir = limit_emir_gonder(
-                                sembol, side_ccxt, miktar, fiyat
-                            )
+                open_symbols = list(_positions.keys())
+                best = select_best_signal(scan, open_symbols)
+
+                if best:
+                    symbol = best['symbol']
+                    signal = best['signal']
+                    price  = best['price']
+                    atr    = best['atr']
+                    lev    = calc_dynamic_leverage(best['adx'])
+                    qty = calc_position_size(
+                        symbol, price, atr, current_balance, lev)
+
+                    if qty > 0:
+                        # Set leverage for this trade
+                        try:
+                            api_call(exchange.set_leverage, lev, symbol)
+                        except Exception as e:
+                            print(f"[Leverage Set] {e}")
+
+                        side_ccxt = 'buy' if signal == 'LONG' else 'sell'
+
+                        if CONFIG['LIMIT_ORDER']:
+                            order = place_limit_order(
+                                symbol, side_ccxt, qty, price)
                         else:
-                            emir = api_cagir(
+                            order = api_call(
                                 exchange.create_market_order,
-                                sembol, side_ccxt, miktar
-                            )
+                                symbol, side_ccxt, qty)
 
-                        # limit_emir_gonder returns None if slippage guard fires
-                        if emir is None:
-                            time.sleep(CONFIG['LOOP_UYKU'])
+                        if order is None:
+                            time.sleep(CONFIG['LOOP_SLEEP'])
                             continue
 
+                        entry_p = float(order.get('average') or price)
+                        sl_mult    = (CONFIG['ATR_SL_MULT_LONG'] if signal == 'LONG'
+                                   else CONFIG['ATR_SL_MULT_SHORT'])
+                        sl      = (entry_p - atr * sl_mult if signal == 'LONG'
+                                   else entry_p + atr * sl_mult)
+                        tp_rate = calc_tp_rate(signal, lev)
+                        tp1     = (entry_p * (1 + tp_rate) if signal == 'LONG'
+                                   else entry_p * (1 - tp_rate))
+
+                        pos = {
+                            'side':             signal,
+                            'entry_price':      entry_p,
+                            'qty':           qty,
+                            'qty_full':       qty,
+                            'atr':              atr,
+                            'leverage':         lev,
+                            'stop_loss':        sl,
+                            'highest_price':    entry_p,
+                            'lowest_price':     entry_p,
+                            'breakeven_reached':False,
+                            'partial_tp_done':  False,
+                            'open_time':        datetime.now(),
+                            'sl_order_id':      None,
+                            'tp_order_id':      None,
+                            'last_exchange_sl':  0.0,
+                            'symbol_ref':       symbol,
+                        }
+
+                        if CONFIG['BRACKET_ORDERS']:
+                            place_bracket_orders(symbol, signal, sl, tp1, pos)
+
                         with state_lock:
-                            in_position       = True
-                            active_side       = sinyal
-                            active_sembol     = sembol
-                            entry_price       = float(
-                                emir.get('average') or fiyat)
-                            active_miktar     = miktar
-                            highest_price     = entry_price
-                            lowest_price      = entry_price
-                            breakeven_reached = False
-                            stop_loss         = (
-                                entry_price - atr * CONFIG['ATR_SL_CARPAN']
-                                if sinyal == 'AL'
-                                else entry_price + atr * CONFIG['ATR_SL_CARPAN']
-                            )
-                            _entry_snap = entry_price
-                            _sl_snap    = stop_loss
+                            active_positions[symbol] = pos
 
-                        _tp_oran  = tp_orani_hesapla()
-                        tp_fiyat  = (
-                            _entry_snap * (1 + _tp_oran)
-                            if sinyal == 'AL'
-                            else _entry_snap * (1 - _tp_oran)
+                        volume_usd = round(qty * entry_p, 2)
+                        fee     = round(calc_fee(volume_usd), 4)
+                        slippage  = abs(entry_p - price) / price * 100
+                        slip_str  = (f"\nSlippage : %{slippage:.3f}"
+                                     if slippage > 0.1 else "")
+                        tp_desc = (
+                            f"ROI %{CONFIG['TP_ROI_TARGET' if signal=='LONG' else 'TP_ROI_TARGET_SHORT']*100:.0f} ({tp1:.4f})"
+                            if CONFIG['TP_ROI_MODE']
+                            else f"%{CONFIG['TP_RATE']*100:.1f} ({tp1:.4f})"
                         )
-
-                        # ── Exchange-side bracket orders [Fix 1] ──────────────
-                        if CONFIG['BRACKET_EMIR']:
-                            bracket_emir_gonder(
-                                sembol, sinyal, _sl_snap, tp_fiyat
-                            )
-                        hacim_usd = round(miktar * _entry_snap, 2)
-                        ucret     = round(ucret_hesapla(hacim_usd), 4)
-                        slippage  = abs(_entry_snap - fiyat) / fiyat * 100
-                        slip_str  = (
-                            f"\nSlippage : %{slippage:.3f}"
-                            if slippage > 0.1 else ""
-                        )
-                        diger = [
-                            r['sembol'] for r in tarama
-                            if r['sinyal'] != 'BEKLE'
-                            and r['sembol'] != sembol
-                        ]
-                        diger_str = ", ".join(diger[:3]) or "Yok"
+                        others = [r['symbol'] for r in scan
+                                 if r['signal'] != 'WAIT'
+                                 and r['symbol'] != symbol]
+                        other_str = ", ".join(others[:3]) or "Yok"
 
                         log_trade({
-                            'Zaman':         datetime.now().strftime(
-                                             '%Y-%m-%d %H:%M:%S'),
-                            'Sembol':        sembol,
-                            'Durum':         'ACILDI',
-                            'Yon':           sinyal,
-                            'Hacim_USD':     hacim_usd,
-                            'Fiyat':         round(_entry_snap, 4),
-                            'PnL_Yuzde_lev': '-',
-                            'PnL_USD_brut':  '-',
-                            'Ucret_USD':     ucret,
+                            'Time':         datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'Symbol':        symbol,
+                            'Status':         'OPENED',
+                            'Side':           signal,
+                            'Volume_USD':     volume_usd,
+                            'Price':         round(entry_p, 4),
+                            'PnL_Pct_lev': '-',
+                            'PnL_USD_gross':  '-',
+                            'Fee_USD':     fee,
                             'PnL_USD_net':   '-',
-                            'Kapanma_Sebebi':'-',
+                            'Close_Reason':'-',
                         }, current_balance)
 
-                        if CONFIG['TP_ROI_MOD']:
-                            tp_aciklama = (f"ROI %{CONFIG['TP_ROI_HEDEF']*100:.0f} "
-                                          f"({tp_fiyat:.4f})")
-                        else:
-                            tp_aciklama = (f"Fiyat %{CONFIG['TP_ORANI']*100:.1f} "
-                                          f"({tp_fiyat:.4f})")
-                        telegram_mesaj_gonder(
-                            f"<b>POZISYON ACILDI — {sinyal}</b>\n"
-                            f"Sembol   : <b>{sembol}</b>\n"
-                            f"Skor     : {en_iyi['skor']:.3f}\n"
-                            f"ADX:{en_iyi['adx']:.1f}  "
-                            f"RSI:{en_iyi['rsi']:.1f}  "
-                            f"StochK:{en_iyi['stoch_k']*100:.0f}%\n"
-                            f"MACD:{en_iyi['macd_dir']}  "
-                            f"OBV:{en_iyi['obv_trend']}  "
-                            f"EMA21:{'USTU' if en_iyi['fiyat'] > en_iyi['ema21'] else 'ALTI'}\n"
-                            f"Giris    : {_entry_snap:.4f}\n"
-                            f"Miktar   : {miktar} ({hacim_usd} USDT)\n"
-                            f"Kaldirac : {CONFIG['LEVERAGE']}x\n"
-                            f"SL       : {_sl_snap:.4f}\n"
-                            f"TP       : {tp_aciklama}\n"
-                            f"Bias 15m : {en_iyi['bias']} | BTC: {btc_trend}\n"
-                            f"Ucret est: {ucret} USDT\n"
-                            f"Diger sin: {diger_str}"
-                            f"{slip_str}"
-                            f"\nBracket  : {'AKTIF (exchange SL+TP)' if CONFIG['BRACKET_EMIR'] else 'KAPALI (yazilim)'}"
+                        send_telegram(
+                            f"<b>POZISYON ACILDI — {signal}</b>\n"
+                            f"Sembol   : <b>{symbol}</b>\n"
+                            f"Skor     : {best['score']:.3f}\n"
+                            f"ADX:{best['adx']:.1f}  "
+                            f"StochK:{best['stoch_k']*100:.0f}%\n"
+                            f"MACD:{best['macd_dir']}  "
+                            f"OBV:{best['obv_trend']}  "
+                            f"Bias:{best['bias']}\n"
+                            f"Giris    : {entry_p:.4f}\n"
+                            f"Miktar   : {qty} ({volume_usd} USDT)\n"
+                            f"Kaldirac : {lev}x (dinamik)\n"
+                            f"SL       : {sl:.4f} ({sl_mult}x ATR)\n"
+                            f"TP       : {tp_desc}\n"
+                            f"BTC Trend: {btc_trend} | Bias: {best['bias']}\n"
+                            f"Ucret est: {fee} USDT\n"
+                            f"Diger sin: {other_str}"
+                            f"{slip_str}\n"
+                            f"Bracket  : {'AKTIF' if CONFIG['BRACKET_ORDERS'] else 'KAPALI'}\n"
+                            f"Toplam pos: {len(active_positions)}/{CONFIG['MAX_CONCURRENT_POSITIONS']}"
                         )
 
-            # STEP D: Manage open position
-            else:
+            # ── STEP D: Manage all open positions ─────────────────────────────
+            sync_counter += 1
+
+            with state_lock:
+                semboller = list(active_positions.keys())
+
+            for symbol in semboller:
                 with state_lock:
-                    _sembol = active_sembol
-                    _side   = active_side
-                    _entry  = entry_price
-                    _miktar = active_miktar
-                    poz_sync_sayac += 1
-                    _sync_sayac = poz_sync_sayac
+                    if symbol not in active_positions:
+                        continue
+                    pos = active_positions[symbol]
 
-                # ── Periodic exchange sync (detects manual closes) ────────────
-                if _sync_sayac % CONFIG['POZ_SYNC_ARALIK'] == 0:
+                # Periodic exchange sync
+                if sync_counter % CONFIG['POSITION_SYNC_INTERVAL'] == 0:
                     try:
-                        syms      = [_sembol + ':USDT']
-                        pozisyonlar = api_cagir(exchange.fetch_positions, syms)
-                        hala_acik   = any(
+                        pos_check     = api_call(exchange.fetch_positions, [symbol])
+                        still_open   = any(
                             float(p.get('contracts', 0) or 0) > 0
-                            for p in pozisyonlar
+                            for p in pos_check
                         )
-                        if not hala_acik:
-                            # Position closed externally (manual, liquidation, etc.)
-                            if CONFIG['BRACKET_EMIR']:
-                                bracket_emir_iptal(_sembol)
+                        if not still_open:
+                            if CONFIG['BRACKET_ORDERS']:
+                                cancel_bracket_orders(symbol, pos)
                             with state_lock:
-                                in_position       = False
-                                active_side       = ""
-                                active_sembol     = ""
-                                entry_price       = 0.0
-                                active_miktar     = 0.0
-                                stop_loss         = 0.0
-                                highest_price     = 0.0
-                                lowest_price      = 0.0
-                                breakeven_reached = False
-                                poz_sync_sayac    = 0
-                                aktif_sl_order_id = None
-                                aktif_tp_order_id = None
-                                son_exchange_sl   = 0.0
-                            telegram_mesaj_gonder(
-                                f"Pozisyon harici kapatildi tespit edildi\n"
-                                f"Sembol : {_sembol}\n"
-                                f"Sebep  : Manuel kapama veya likidasyon\n"
-                                f"Bot yeni sinyal aramaya devam ediyor."
+                                active_positions.pop(symbol, None)
+                            send_telegram(
+                                f"Pozisyon harici kapatildi — {symbol}\n"
+                                f"Manuel kapama veya likidasyon.\n"
+                                f"Bot scan devam ediyor."
                             )
-                            time.sleep(CONFIG['LOOP_UYKU'])
                             continue
                     except Exception as e:
-                        print(f"[Pozisyon Sync Hatasi] {e}")
+                        print(f"[Sync Hatasi {symbol}] {e}")
 
-                fiyat = son_fiyat_al(_sembol)
-                if fiyat == 0:
-                    time.sleep(CONFIG['LOOP_UYKU'])
+                # Max hold time check [v3.9]
+                duration_min = (datetime.now() - pos['open_time']).seconds / 60
+                if duration_min >= CONFIG['MAX_POSITION_HOURS'] * 60:
+                    send_telegram(
+                        f"MAX SURE — {symbol}\n"
+                        f"{CONFIG['MAX_POSITION_HOURS']}s sure doldu, "
+                        f"pozisyon kapatiliyor."
+                    )
+                    _close_thread([symbol])
                     continue
 
-                with state_lock:
-                    _prev_sl = stop_loss
-                    trailing_stop_guncelle(fiyat)
-                    _sl = stop_loss
+                price = get_price(symbol)
+                if price == 0:
+                    continue
 
-                # Update exchange-side SL if trailing moved enough [Fix 1]
-                if CONFIG['BRACKET_EMIR'] and _sl != _prev_sl:
-                    sl_order_guncelle(_sembol, _side, _sl)
+                # Trailing stop
+                with state_lock:
+                    prev_sl    = pos['stop_loss']
+                    new_sl, sl_degisti = update_trailing_stop(price, pos)
+
+                if sl_degisti and CONFIG['BRACKET_ORDERS']:
+                    with state_lock:
+                        update_sl_order(symbol, pos['side'], new_sl, pos)
+
+                with state_lock:
+                    _side    = pos['side']
+                    _entry   = pos['entry_price']
+                    _qty  = pos['qty']
+                    _lev     = pos['leverage']
+                    _sl      = pos['stop_loss']
+                    _partial = pos['partial_tp_done']
 
                 raw_pnl      = (
-                    (fiyat - _entry) / _entry if _side == 'AL'
-                    else (_entry - fiyat) / _entry
+                    (price - _entry) / _entry if _side == 'LONG'
+                    else (_entry - price) / _entry
                 )
-                lev_pnl_pct  = raw_pnl * CONFIG['LEVERAGE'] * 100
-                pnl_usd_brut = (
-                    _miktar * (fiyat - _entry) if _side == 'AL'
-                    else _miktar * (_entry - fiyat)
+                lev_pnl_pct  = raw_pnl * _lev * 100
+                pnl_usd_gross = (
+                    _qty * (price - _entry) if _side == 'LONG'
+                    else _qty * (_entry - price)
                 )
-                notional     = _miktar * _entry
-                ucret        = ucret_hesapla(notional)
-                pnl_usd_net  = pnl_usd_brut - ucret
+                notional     = _qty * _entry
+                fee        = calc_fee(notional)
+                pnl_usd_net  = pnl_usd_gross - fee
+                tp_rate      = calc_tp_rate(_side, _lev)
+                tp2_rate     = CONFIG['TP2_ROI_TARGET'] / _lev
 
-                is_sl = (
-                    (_side == 'AL'  and fiyat <= _sl) or
-                    (_side == 'SAT' and fiyat >= _sl)
-                )
-                is_tp = raw_pnl >= tp_orani_hesapla()
+                is_sl   = ((_side == 'LONG' and price <= _sl) or
+                           (_side == 'SHORT' and price >= _sl))
+                is_tp1  = (not _partial and raw_pnl >= tp_rate)
+                is_tp2  = (_partial and raw_pnl >= tp2_rate)
 
-                if is_sl or is_tp:
-                    sebep     = "TP" if is_tp else "SL"
-                    neden_str = "TAKE PROFIT" if is_tp else "STOP LOSS"
-                    exit_side = 'sell' if _side == 'AL' else 'buy'
-
-                    # Cancel bracket orders before sending software close [Fix 1]
-                    # (prevents double-close if exchange already filled one)
-                    if CONFIG['BRACKET_EMIR']:
-                        bracket_emir_iptal(_sembol)
-
-                    # Check if exchange already closed it via bracket order
-                    try:
-                        syms_chk    = [_sembol + ':USDT']
-                        poz_chk     = api_cagir(exchange.fetch_positions, syms_chk)
-                        hala_var    = any(
-                            float(p.get('contracts', 0) or 0) > 0
-                            for p in poz_chk
+                # ── Partial TP1 [v3.9] ────────────────────────────────────────
+                if is_tp1 and CONFIG['PARTIAL_TP_ACTIVE'] and not _partial:
+                    partial_qty = float(
+                        exchange.amount_to_precision(
+                            symbol,
+                            _qty * CONFIG['PARTIAL_TP_PCT']
                         )
-                    except Exception:
-                        hala_var = True  # assume still open on API error
-
-                    if hala_var:
-                        api_cagir(
+                    )
+                    remaining_qty = float(
+                        exchange.amount_to_precision(
+                            symbol,
+                            _qty * (1 - CONFIG['PARTIAL_TP_PCT'])
+                        )
+                    )
+                    exit_side = 'sell' if _side == 'LONG' else 'buy'
+                    try:
+                        # Cancel existing bracket orders
+                        if CONFIG['BRACKET_ORDERS']:
+                            with state_lock:
+                                cancel_bracket_orders(symbol, pos)
+                        # Close partial
+                        api_call(
                             exchange.create_market_order,
-                            _sembol, exit_side, _miktar,
+                            symbol, exit_side, partial_qty,
                             params={'reduceOnly': True}
                         )
-                    else:
-                        print(f"[Kapan] Pozisyon zaten exchange tarafindan kapatilmis")
+                        # Update position state
+                        with state_lock:
+                            if symbol in active_positions:
+                                active_positions[symbol]['qty']         = remaining_qty
+                                active_positions[symbol]['partial_tp_done'] = True
+                        # Place new bracket for remaining at TP2
+                        if CONFIG['BRACKET_ORDERS'] and remaining_qty > 0:
+                            tp2_price = (price * (1 + tp2_rate) if _side == 'LONG'
+                                         else price * (1 - tp2_rate))
+                            with state_lock:
+                                pos2 = active_positions.get(symbol, {})
+                            if pos2:
+                                place_bracket_orders(
+                                    symbol, _side, _sl, tp2_price, pos2)
 
-                    yeni_bakiye = get_balance()
+                        partial_pnl = partial_qty * (price - _entry if _side == 'LONG'
+                                                     else _entry - price)
+                        new_balance = get_balance()
+                        log_trade({
+                            'Time':         datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'Symbol':        symbol,
+                            'Status':         'CLOSED',
+                            'Side':           _side,
+                            'Volume_USD':     round(partial_qty * price, 2),
+                            'Price':         round(price, 4),
+                            'PnL_Pct_lev': round(lev_pnl_pct, 2),
+                            'PnL_USD_gross':  round(partial_pnl, 4),
+                            'Fee_USD':     round(calc_fee(partial_qty*price), 4),
+                            'PnL_USD_net':   round(partial_pnl - calc_fee(partial_qty*price), 4),
+                            'Close_Reason':'PARTIAL_TP1',
+                        }, new_balance)
+                        send_telegram(
+                            f"<b>KISMI TP1 — {symbol}</b>\n"
+                            f"%{CONFIG['PARTIAL_TP_PCT']*100:.0f} kapatildi "
+                            f"({partial_qty} adet)\n"
+                            f"Kalan %{(1-CONFIG['PARTIAL_TP_PCT'])*100:.0f}: "
+                            f"{remaining_qty} adet TP2 icin bekliyor\n"
+                            f"ROI su an: <b>%{lev_pnl_pct:.2f}</b>\n"
+                            f"PnL (kismi): {partial_pnl:+.4f} USDT"
+                        )
+                    except Exception as e:
+                        send_telegram(
+                            f"Kismi TP hatasi — {symbol}: {str(e)[:80]}")
+                    continue
 
+                # ── Full close (SL or TP2 or TP if no partial) ───────────────
+                if is_sl or is_tp2 or (is_tp1 and not CONFIG['PARTIAL_TP_ACTIVE']):
+                    reason     = ("TP2" if is_tp2 else
+                                 "TP"  if is_tp1 else "SL")
+                    neden_str = ("TAKE PROFIT 2" if is_tp2 else
+                                 "TAKE PROFIT"   if is_tp1 else "STOP LOSS")
+                    exit_side = 'sell' if _side == 'LONG' else 'buy'
+
+                    if CONFIG['BRACKET_ORDERS']:
+                        with state_lock:
+                            cancel_bracket_orders(symbol, pos)
+
+                    try:
+                        pos_check2  = api_call(exchange.fetch_positions, [symbol])
+                        still_open  = any(
+                            float(p.get('contracts', 0) or 0) > 0
+                            for p in pos_check2
+                        )
+                    except Exception:
+                        still_open = True
+
+                    if still_open:
+                        api_call(
+                            exchange.create_market_order,
+                            symbol, exit_side, _qty,
+                            params={'reduceOnly': True}
+                        )
+
+                    new_balance = get_balance()
                     log_trade({
-                        'Zaman':         datetime.now().strftime(
-                                         '%Y-%m-%d %H:%M:%S'),
-                        'Sembol':        _sembol,
-                        'Durum':         'KAPANDI',
-                        'Yon':           _side,
-                        'Hacim_USD':     round(_miktar * fiyat, 2),
-                        'Fiyat':         round(fiyat, 4),
-                        'PnL_Yuzde_lev': round(lev_pnl_pct, 2),
-                        'PnL_USD_brut':  round(pnl_usd_brut, 4),
-                        'Ucret_USD':     round(ucret, 4),
+                        'Time':         datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'Symbol':        symbol,
+                        'Status':         'CLOSED',
+                        'Side':           _side,
+                        'Volume_USD':     round(_qty * price, 2),
+                        'Price':         round(price, 4),
+                        'PnL_Pct_lev': round(lev_pnl_pct, 2),
+                        'PnL_USD_gross':  round(pnl_usd_gross, 4),
+                        'Fee_USD':     round(fee, 4),
                         'PnL_USD_net':   round(pnl_usd_net, 4),
-                        'Kapanma_Sebebi':sebep,
-                    }, yeni_bakiye)
+                        'Close_Reason':reason,
+                    }, new_balance)
 
-                    telegram_mesaj_gonder(
+                    send_telegram(
                         f"<b>POZISYON KAPANDI — {neden_str}</b>\n"
-                        f"Sembol   : <b>{_sembol}</b> | {_side}\n"
+                        f"Sembol   : <b>{symbol}</b> | {_side} {_lev}x\n"
                         f"Giris    : {_entry:.4f}\n"
-                        f"Cikis    : {fiyat:.4f}\n"
+                        f"Cikis    : {price:.4f}\n"
                         f"Ham PnL  : %{raw_pnl*100:.2f}\n"
-                        f"Lev PnL  : <b>%{lev_pnl_pct:.2f}</b>\n"
-                        f"Brut PnL : {pnl_usd_brut:+.4f} USDT\n"
-                        f"Ucret    : -{ucret:.4f} USDT\n"
+                        f"Lev ROI  : <b>%{lev_pnl_pct:.2f}</b>\n"
                         f"Net PnL  : <b>{pnl_usd_net:+.4f} USDT</b>\n"
-                        f"Yeni Bak.: <b>{yeni_bakiye:.2f} USDT</b>"
+                        f"Yeni Bak.: <b>{new_balance:.2f} USDT</b>\n"
+                        f"Acik pos.: {len(active_positions)-1}/{CONFIG['MAX_CONCURRENT_POSITIONS']}"
                     )
 
-                    # Per-symbol ban logic [New C]
-                    if sebep == 'SL':
+                    # Per-symbol ban logic
+                    if reason == 'SL':
                         with state_lock:
-                            cnt = sembol_kayip_sayac.get(_sembol, 0) + 1
-                            sembol_kayip_sayac[_sembol] = cnt
-                            if cnt >= CONFIG['MAX_AYNI_SEMBOL_KAYIP']:
-                                bitis = datetime.now() + timedelta(
-                                    minutes=CONFIG['SEMBOL_BAN_DAKIKA']
-                                )
-                                sembol_ban_bitis[_sembol]   = bitis
-                                sembol_kayip_sayac[_sembol] = 0
-                        if cnt >= CONFIG['MAX_AYNI_SEMBOL_KAYIP']:
-                            telegram_mesaj_gonder(
-                                f"{_sembol} gecici banlandi\n"
-                                f"Sebep: {CONFIG['MAX_AYNI_SEMBOL_KAYIP']} "
-                                f"ardisik SL\n"
-                                f"Ban bitis: "
-                                f"{bitis.strftime('%H:%M:%S')}"
+                            cnt = symbol_loss_count.get(symbol, 0) + 1
+                            symbol_loss_count[symbol] = cnt
+                            if cnt >= CONFIG['MAX_CONSECUTIVE_LOSSES']:
+                                expiry = datetime.now() + timedelta(
+                                    minutes=CONFIG['SYMBOL_BAN_MINUTES'])
+                                symbol_ban_until[symbol]   = expiry
+                                symbol_loss_count[symbol] = 0
+                        if cnt >= CONFIG['MAX_CONSECUTIVE_LOSSES']:
+                            send_telegram(
+                                f"{symbol} gecici banlandi\n"
+                                f"Sebep: {CONFIG['MAX_CONSECUTIVE_LOSSES']} ardisik SL\n"
+                                f"Ban expiry: {expiry.strftime('%H:%M:%S')}"
                             )
+                        # Time-based cooldown [v3.9]
+                        if CONFIG['LOSS_COOLDOWN_MINUTES'] > 0:
+                            with state_lock:
+                                loss_cooldown_until = (
+                                    datetime.now() + timedelta(
+                                        minutes=CONFIG['LOSS_COOLDOWN_MINUTES'])
+                                )
                     else:
-                        # TP resets the loss counter
                         with state_lock:
-                            sembol_kayip_sayac[_sembol] = 0
-
-                    if pnl_usd_net < 0:
-                        with state_lock:
-                            kayip_sonrasi_bekleme = CONFIG['GIRIS_COOLDOWN']
+                            symbol_loss_count[symbol] = 0
 
                     with state_lock:
-                        in_position       = False
-                        active_side       = ""
-                        active_sembol     = ""
-                        entry_price       = 0.0
-                        active_miktar     = 0.0
-                        stop_loss         = 0.0
-                        highest_price     = 0.0
-                        lowest_price      = 0.0
-                        breakeven_reached = False
-                        aktif_sl_order_id = None
-                        aktif_tp_order_id = None
-                        son_exchange_sl   = 0.0
+                        active_positions.pop(symbol, None)
 
-            time.sleep(CONFIG['LOOP_UYKU'])
+            time.sleep(CONFIG['LOOP_SLEEP'])
 
         except Exception as e:
             print(f"[Dongu Hatasi] {e}")
-            telegram_mesaj_gonder(f"<b>Dongu Hatasi:</b>\n{e}")
-            time.sleep(CONFIG['LOOP_UYKU'])
+            send_telegram(f"<b>Dongu Hatasi:</b>\n{e}")
+            time.sleep(CONFIG['LOOP_SLEEP'])
 
 # ==============================================================================
-# 15. ENTRY POINT
+# 17. ENTRY POINT
 # ==============================================================================
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Multi-Symbol Bot v3.7')
-    parser.add_argument(
-        '--backtest-only', action='store_true',
-        help='Run backtest for all symbols then exit'
-    )
+    parser = argparse.ArgumentParser(description='Multi-Symbol Bot v3.9')
+    parser.add_argument('--backtest-only', action='store_true')
     args = parser.parse_args()
 
     try:
         print("[BASLATILIYOR] Piyasalar yukleniyor...")
-        api_cagir(exchange.load_markets)
+        markets = api_call(exchange.load_markets)
+
+        # Validate watchlist — remove any symbol not found in this exchange/mode
+        gecersiz = [s for s in CONFIG['SYMBOL_LIST']
+                    if s not in markets and
+                    s not in markets and s.replace('/', '') not in markets]
+        if gecersiz:
+            for s in gecersiz:
+                CONFIG['SYMBOL_LIST'].remove(s)
+                CONFIG['SYMBOL_CATEGORIES'].pop(s, None)
+            uyari_str = ', '.join(gecersiz)
+            print(f"[UYARI] Bu semboller bu modda mevcut degil, kaldirildi: {uyari_str}")
+            send_telegram(
+                f"Sembol uyarisi\n"
+                f"Su semboller bu exchange/modda bulunamadi ve listeden kaldirildi:\n"
+                f"{uyari_str}\n"
+                f"Kalan: {len(CONFIG['SYMBOL_LIST'])} symbol"
+            )
+        print(f"[OK] {len(CONFIG['SYMBOL_LIST'])} symbol aktif")
 
         if args.backtest_only:
-            for sym in CONFIG['SEMBOL_LISTESI']:
-                print(backtest_calistir(sym, CONFIG['ENTRY_TF'], limit=300))
+            for sym in CONFIG['SYMBOL_LIST']:
+                print(run_backtest(sym, CONFIG['ENTRY_TF'], limit=300))
                 print()
             sys.exit(0)
 
-        # Set leverage for every symbol
-        hatali = []
-        for sembol in CONFIG['SEMBOL_LISTESI']:
+        # Set leverage
+        failed = []
+        for symbol in CONFIG['SYMBOL_LIST']:
             try:
-                api_cagir(exchange.set_leverage, CONFIG['LEVERAGE'], sembol)
-                print(f"[OK] Kaldirac {CONFIG['LEVERAGE']}x -> {sembol}")
+                api_call(exchange.set_leverage, CONFIG['LEVERAGE'], symbol)
+                print(f"[OK] {CONFIG['LEVERAGE']}x → {symbol}")
             except Exception as e:
-                print(f"[UYARI] {sembol}: {e}")
-                hatali.append(sembol)
+                print(f"[UYARI] {symbol}: {e}")
+                failed.append(symbol)
+        if failed:
+            send_telegram(
+                f"Kaldirac uyarisi:\n{', '.join(failed)}\nElle kontrol edin.")
 
-        if hatali:
-            telegram_mesaj_gonder(
-                f"Kaldirac uyarisi:\n"
-                f"Ayarlanamayan: {', '.join(hatali)}\n"
-                f"Elle kontrol edin."
-            )
-
-        acik_pozisyon_kontrol()
+        reconcile_open_positions()
 
         with state_lock:
-            baslangic_bakiye = get_balance()
-            _bas = baslangic_bakiye
+            start_balance = get_balance()
+            _start_bal = start_balance
 
-        bt_sonuc = backtest_calistir(
-            CONFIG['SEMBOL_LISTESI'][0], CONFIG['ENTRY_TF'], limit=200
-        )
-        sembol_listesi_str = "\n".join(
-            f"  - {s}" for s in CONFIG['SEMBOL_LISTESI']
-        )
+        bt = run_backtest(CONFIG['SYMBOL_LIST'][0],
+                               CONFIG['ENTRY_TF'], limit=200)
+        sembol_str = "\n".join(f"  {s}" for s in CONFIG['SYMBOL_LIST'])
 
-        telegram_mesaj_gonder(
-            f"<b>Bot Baslatildi — v3.7</b>\n"
-            f"Tarama listesi:\n{sembol_listesi_str}\n"
-            f"Kaldirac   : {CONFIG['LEVERAGE']}x\n"
-            f"Risk/islem : %{CONFIG['RISK_ORANI']*100:.0f}\n"
-            f"Gunluk SL  : %{CONFIG['GUNLUK_MAX_ZARAR']*100:.0f}\n"
-            f"TP hedef   : %{CONFIG['TP_ORANI']*100:.1f}\n"
-            f"Sinyal esik: StochK &lt;{int(CONFIG['STOCH_ASIRI_SATIS']*100)}% AL | "
-            f"StochK &gt;{int(CONFIG['STOCH_ASIRI_ALIS']*100)}% SAT\n"
-            f"Skor motor : 7 faktor + mum carpan\n"
-            f"Zaman cer. : {CONFIG['ENTRY_TF']} + "
-            f"{CONFIG['BIAS_TF']} bias\n"
-            f"Bakiye     : <b>{_bas:.2f} USDT</b>\n"
-            f"{bt_sonuc}",
-            reply_markup=ana_klavye()
+        send_telegram(
+            f"<b>Bot Baslatildi — v3.9</b>\n"
+            f"Tarama listesi ({len(CONFIG['SYMBOL_LIST'])} symbol):\n"
+            f"{sembol_str}\n"
+            f"Max pozisyon   : {CONFIG['MAX_CONCURRENT_POSITIONS']}\n"
+            f"Max marjin     : %{CONFIG['MAX_TOTAL_MARGIN_PCT']*100:.0f}\n"
+            f"Kaldirac       : {CONFIG['LEVERAGE']}x baz "
+            f"(max {CONFIG['MAX_LEVERAGE']}x dinamik)\n"
+            f"Risk/islem     : %{CONFIG['RISK_PCT']*100:.0f}\n"
+            f"Gunluk SL      : %{CONFIG['DAILY_MAX_LOSS']*100:.0f}\n"
+            f"TP AL/SAT      : ROI %{CONFIG['TP_ROI_TARGET']*100:.0f} / "
+            f"%{CONFIG['TP_ROI_TARGET_SHORT']*100:.0f}\n"
+            f"Kismi TP       : {'AKTIF' if CONFIG['PARTIAL_TP_ACTIVE'] else 'KAPALI'}\n"
+            f"Max sure       : {CONFIG['MAX_POSITION_HOURS']}h\n"
+            f"Skor motoru    : 8 faktor (RSI kaldirildi, BTC eklendi)\n"
+            f"Bakiye         : <b>{_start_bal:.2f} USDT</b>\n"
+            f"{bt}",
+            reply_markup=main_keyboard()
         )
 
         t_thread = threading.Thread(target=trade_loop, daemon=True)
         t_thread.start()
 
-        print("[OK] Telegram polling baslatildi. Cikmak icin CTRL+C.")
-
-        # Restart polling on connection reset (Windows error 10054).
-        # KeyboardInterrupt is caught separately to allow clean shutdown
-        # without spamming "Break infinity polling" to the terminal.
+        print("[OK] Telegram polling baslatildi. CTRL+C ile dur.")
         _kapatiliyor = False
         while not _kapatiliyor:
             try:
-                t_bot.infinity_polling(
-                    timeout=30,
-                    long_polling_timeout=25,
-                    restart_on_change=False,
-                    allowed_updates=None,
-                )
+                t_bot.infinity_polling(timeout=30, long_polling_timeout=25,
+                                       restart_on_change=False,
+                                       allowed_updates=None)
             except KeyboardInterrupt:
                 _kapatiliyor = True
             except Exception as e:
                 if _kapatiliyor:
                     break
-                err_str = str(e).lower()
-                if 'break' in err_str or 'interrupt' in err_str:
+                if 'break' in str(e).lower() or 'interrupt' in str(e).lower():
                     _kapatiliyor = True
                 else:
-                    print(f"[Polling yeniden baslatiliyor] {e}")
+                    print(f"[Polling yeniden] {e}")
                     time.sleep(5)
 
     except (KeyboardInterrupt, SystemExit):
@@ -2311,6 +2323,6 @@ if __name__ == "__main__":
     finally:
         print("\n[DURDURULDU] Bot kapatildi.")
         try:
-            telegram_mesaj_gonder("Bot kapatildi.")
+            send_telegram("Bot kapatildi.")
         except Exception:
             pass

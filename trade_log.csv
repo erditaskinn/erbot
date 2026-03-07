@@ -1,1 +1,2 @@
-"Zaman";"Sembol";"Durum";"Yon";"Hacim_USD";"Fiyat";"PnL_Yuzde_lev";"PnL_USD_brut";"Ucret_USD";"PnL_USD_net";"Kapanma_Sebebi";"Bakiye_USDT"
+"Time";"Symbol";"Status";"Side";"Volume_USD";"Price";"PnL_Pct_lev";"PnL_USD_gross";"Fee_USD";"PnL_USD_net";"Close_Reason";"Balance_USDT"
+"2026-03-07 22:08:55";"ARB/USDT";"OPENED";"LONG";"2502.57";"0.097";"-";"-";"2.0021";"-";"-";"5000.0"
